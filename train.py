@@ -452,7 +452,12 @@ def run_training(data_path: Path, model_path: Path, output_dir: Path, cache_stat
     launcher = output_dir / 'launch_train.py'
     launcher.write_text(f'''#!/usr/bin/env python3
 import sys
+import os
 import argparse
+
+# Force disable FlashAttention at every possible level
+os.environ['MS_ENABLE_FLASH_ATTENTION'] = '0'
+os.environ['MS_ENABLE_FA_FLATTEN'] = 'off'
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", required=True)
@@ -464,7 +469,6 @@ args = parser.parse_args()
 from mindformers.tools.register import MindFormerConfig
 from mindformers.core.context import build_context
 
-# Load config first
 config = MindFormerConfig(args.config)
 if args.auto_trans_ckpt.lower() == "true":
     config.auto_trans_ckpt = True
@@ -472,9 +476,38 @@ if args.use_parallel.lower() == "true":
     config.use_parallel = True
 config.run_mode = args.run_mode
 
-# Set global context BEFORE building Trainer/dataset
-# This ensures is_legacy_model() returns False
+# CRITICAL: Force use_flash_attention=False in model_config
+# This ensures the Qwen3Config object gets this value regardless of config.json
+if hasattr(config, 'model') and hasattr(config.model, 'model_config'):
+    config.model.model_config.use_flash_attention = False
+    print("[LAUNCHER] Forced use_flash_attention=False in model_config")
+
 build_context(config)
+
+# Monkey-patch the Qwen3Config class to force use_flash_attention=False
+try:
+    from mindformers.models.qwen3.configuration_qwen3 import Qwen3Config
+    _orig_init = Qwen3Config.__init__
+    def _patched_init(self, *a, **kw):
+        kw['use_flash_attention'] = False
+        _orig_init(self, *a, **kw)
+        self.use_flash_attention = False
+    Qwen3Config.__init__ = _patched_init
+    print("[LAUNCHER] Monkey-patched Qwen3Config to force use_flash_attention=False")
+except Exception as e:
+    print(f"[LAUNCHER] Warning: Could not patch Qwen3Config: {{e}}")
+
+# Also patch TransformerConfig if it exists
+try:
+    from mindformers.parallel_core.transformer_config import TransformerConfig
+    _orig_tc_init = TransformerConfig.__init__
+    def _patched_tc_init(self, *a, **kw):
+        _orig_tc_init(self, *a, **kw)
+        self.use_flash_attention = False
+    TransformerConfig.__init__ = _patched_tc_init
+    print("[LAUNCHER] Monkey-patched TransformerConfig to force use_flash_attention=False")
+except Exception as e:
+    print(f"[LAUNCHER] Warning: Could not patch TransformerConfig: {{e}}")
 
 from mindformers.trainer import Trainer
 trainer = Trainer(args=config)
