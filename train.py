@@ -34,6 +34,8 @@ os.environ.setdefault('MS_BUILD_PROCESS_NUM', '32')  # Parallel graph compilatio
 os.environ.setdefault('MS_COMPILER_CACHE_ENABLE', '1')  # Cache compiled graphs for faster restarts
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')  # Avoid fork warnings
 os.environ.setdefault('GLOG_v', '1')  # Show actual errors during compilation
+os.environ['MS_ENABLE_FLASH_ATTENTION'] = '0'  # Force disable FlashAttention globally (910ProA unsupported)
+os.environ['MS_ENABLE_FA_FLATTEN'] = 'off'  # Disable FA flatten optimization
 
 
 def find_executable(name: str) -> str:
@@ -426,6 +428,22 @@ def run_training(data_path: Path, model_path: Path, output_dir: Path, cache_stat
     # Generate config (with caching)
     config_path, config_cached = generate_mindformers_config(model_path, data_path, output_dir)
     cache_status['config'] = 'cached' if config_cached else 'created'
+
+    # Force disable FlashAttention in model's config.json (use_legacy=False reads from here)
+    model_config_json = model_path / 'config.json'
+    if model_config_json.exists():
+        with open(model_config_json, 'r') as f:
+            mcfg = json.load(f)
+        changed = False
+        if mcfg.get('use_flash_attention') is not False:
+            mcfg['use_flash_attention'] = False
+            changed = True
+        if changed:
+            with open(model_config_json, 'w') as f:
+                json.dump(mcfg, f, indent=2, ensure_ascii=False)
+            print(f"[FIX] Set use_flash_attention=False in {model_config_json}")
+        else:
+            print(f"[OK] use_flash_attention already False in {model_config_json}")
 
     # Find msrun
     msrun_path = find_executable('msrun')
