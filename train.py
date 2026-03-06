@@ -641,10 +641,16 @@ trainer.train()
                           f"kv_groups={self.num_query_groups}, dropout={self.attention_dropout}")
 
                 def _expand_kv_heads(self, x, batch, seq_len):
-                    """Expand KV heads to match query heads via repeat (GQA support)."""
+                    """Expand KV heads to match query heads via tile+reshape (GQA).
+                    Input:  (B, N_kv, S, D)
+                    Output: (B, N_q, S, D) where N_q = N_kv * num_heads_per_group
+                    """
                     if self.num_heads_per_group <= 1:
                         return x
-                    x = ops.repeat_interleave(x, self.num_heads_per_group, axis=1)
+                    b, n_kv, s, d = self.shape(x)
+                    x = self.reshape(x, (b, n_kv, 1, s, d))
+                    x = ops.tile(x, (1, 1, self.num_heads_per_group, 1, 1))
+                    x = self.reshape(x, (b, n_kv * self.num_heads_per_group, s, d))
                     return x
 
                 def construct(self,
