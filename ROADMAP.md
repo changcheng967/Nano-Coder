@@ -1,9 +1,9 @@
 # Nano Coder — Roadmap to the World's Best Small Coding Model
-# =============================================================
-# Goal: Best-in-class 8B coding agent, scaling to 32B to approach frontier
-# Hardware: 4×Ascend 910 NPU (32GB each, 128GB total), OpenI platform
-# Benchmark: SWE-bench Verified (500 real GitHub issues)
-# Last Updated: 2026-03-05
+
+> **Goal:** Best-in-class 8B coding agent, scaling to 32B to approach frontier  
+> **Hardware:** 4×Ascend 910 NPU (32GB each, 128GB total), OpenI platform  
+> **Benchmark:** SWE-bench Verified (500 real GitHub issues)  
+> **Last Updated:** 2026-03-05
 
 ## The Battlefield: SWE-bench Verified (March 2026)
 
