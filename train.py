@@ -36,6 +36,7 @@ os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')  # Avoid fork warnings
 os.environ.setdefault('GLOG_v', '1')  # Show actual errors during compilation
 os.environ['MS_ENABLE_FLASH_ATTENTION'] = '0'  # Force disable FlashAttention globally (910ProA unsupported)
 os.environ['MS_ENABLE_FA_FLATTEN'] = 'off'  # Disable FA flatten optimization
+os.environ['MS_DEV_GRAPH_KERNEL_FLAGS'] = '--disable_pass=FlashAttentionFusionV1,FlashAttentionFusionV2'  # Disable FA fusion passes
 
 
 def find_executable(name: str) -> str:
@@ -458,6 +459,7 @@ import argparse
 # Force disable FlashAttention at every possible level
 os.environ['MS_ENABLE_FLASH_ATTENTION'] = '0'
 os.environ['MS_ENABLE_FA_FLATTEN'] = 'off'
+os.environ['MS_DEV_GRAPH_KERNEL_FLAGS'] = '--disable_pass=FlashAttentionFusionV1,FlashAttentionFusionV2'
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", required=True)
