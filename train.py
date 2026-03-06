@@ -208,22 +208,17 @@ def generate_mindformers_config(model_path: Path, data_path: Path, output_dir: P
     Hardware: 4× Ascend 910ProA (32 GB HBM each)
     Optimized for LoRA fine-tuning with memory constraints.
 
+    IMPORTANT: use_flash_attention must be False on 910ProA (not supported).
+    Pipeline parallelism (pp=4, mp=1) to avoid Tile sharding bug.
+
     Returns: (config_path, was_cached)
     """
 
     config_path = output_dir / 'finetune_qwen3_8b_lora.yaml'
 
-    # Cache: return existing config if it matches the current model/data paths
-    if config_path.exists():
-        try:
-            existing = config_path.read_text()
-            if str(model_path) in existing and str(data_path) in existing:
-                print(f"[CACHE] Config: {config_path}")
-                return config_path, True
-        except Exception:
-            pass  # Regenerate if read fails
+    # Always regenerate config to pick up any changes (no caching)
 
-    # Generate parallel_speed_up.json with absolute path
+    # Generate parallel_speed_up.json
     speed_up_path = output_dir / 'parallel_speed_up.json'
     if not speed_up_path.exists():
         with open(speed_up_path, 'w') as f:
@@ -263,7 +258,7 @@ optimizer:
 lr_schedule:
   type: ConstantWarmUpLR
   learning_rate: 1.e-6
-  warmup_ratio: 0.0
+  warmup_ratio: 0
   total_steps: -1
 
 train_dataset: &train_dataset
@@ -316,28 +311,24 @@ context:
     parallel_speed_up_json_path: "{speed_up_path}"
 
 parallel_config:
-  data_parallel: &dp 1
+  data_parallel: 1
   model_parallel: 1
   pipeline_stage: 4
   micro_batch_num: 4
   use_seq_parallel: False
   gradient_aggregation_group: 1
-
-# micro_batch_interleave_num=2 can accelerate when mp>1 but doubles activation memory
-# With 32GB cards, keep at 1 for safety; try 2 if memory allows
-micro_batch_interleave_num: 1
+  micro_batch_interleave_num: 1
 
 parallel:
   parallel_mode: 1
   enable_alltoall: False
   full_batch: False
-  dataset_strategy: [
-      [*dp, 1],
-      [*dp, 1],
-      [*dp, 1],
-      [*dp, 1],
-      [*dp, 1, 1, 1]
-    ]
+  dataset_strategy:
+    - [1, 1]
+    - [1, 1]
+    - [1, 1]
+    - [1, 1]
+    - [1, 1, 1, 1]
   search_mode: "sharding_propagation"
   strategy_ckpt_config:
     save_file: "{output_dir / 'ckpt_strategy.ckpt'}"
@@ -352,6 +343,7 @@ recompute_config:
 
 model:
   model_config:
+    use_flash_attention: False
     qkv_concat: True
     hidden_dropout: 0.0
     input_sliced_sig: True
@@ -365,7 +357,6 @@ model:
     softmax_compute_dtype: "float32"
     rotary_dtype: "float32"
     fp32_residual_connection: True
-    use_flash_attention: False
     pet_config:
       pet_type: lora
       lora_rank: 8
