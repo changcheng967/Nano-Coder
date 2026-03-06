@@ -317,9 +317,9 @@ context:
 
 parallel_config:
   data_parallel: &dp 1
-  model_parallel: 2
-  pipeline_stage: 2
-  micro_batch_num: 2
+  model_parallel: 1
+  pipeline_stage: 4
+  micro_batch_num: 4
   use_seq_parallel: False
   gradient_aggregation_group: 1
 
@@ -347,8 +347,8 @@ parallel:
 recompute_config:
   recompute: True
   select_recompute: False
-  parallel_optimizer_comm_recompute: True
-  mp_comm_recompute: True
+  parallel_optimizer_comm_recompute: False
+  mp_comm_recompute: False
 
 model:
   model_config:
