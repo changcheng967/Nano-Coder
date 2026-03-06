@@ -317,7 +317,8 @@ parallel_config:
   micro_batch_num: 4
   use_seq_parallel: False
   gradient_aggregation_group: 1
-  micro_batch_interleave_num: 1
+
+micro_batch_interleave_num: 1
 
 parallel:
   parallel_mode: 1
