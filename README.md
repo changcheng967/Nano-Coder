@@ -1,97 +1,128 @@
-# Nano Coder Series
+# Nano Coder
 
-**Goal: Build competitive open-source coding models through knowledge distillation**
+**Goal: Build the world's best 8B coding agent through knowledge distillation**
 
-Training specialized coding models from frontier teachers (Kimi K2.5 at 76.8% SWE-bench).
+Training competitive coding models on Ascend 910ProA NPUs via MindFormers.
+
+## Status
+
+**NC-1 Preview**: Pipeline validation on OpenI platform
+
+| Component | Status |
+|-----------|--------|
+| MindFormers config generation | Done |
+| C2NET data loading | Done |
+| 4-NPU pipeline parallelism | Done |
+| FlashAttention patch (910ProA) | Done |
+| GQA support | Done |
 
 ## Quick Start
 
 ```bash
-# Set your NVIDIA NIM API key (free at build.nvidia.com)
-export NVIDIA_API_KEY="nvapi-xxxxx"
-
-# Run Stage 1 Preview (2 hours)
-python train.py --max-tasks 100
+# On OpenI platform with c2net context
+python train.py
 ```
 
-## Research-Based Roadmap
+The script automatically:
+1. Loads model/data paths from c2net context
+2. Generates MindFormers YAML config
+3. Patches FlashAttention for 910ProA compatibility
+4. Launches 4-NPU distributed training with `msrun`
 
-Based on published results from SWE-Lego (Huawei), SWE-Star, and Devstral:
+## Hardware
 
-| Stage | Time | Model | Data | Expected |
-|-------|------|-------|------|----------|
-| Baseline | 0h | Qwen3-8B | - | ~25% |
-| **NC1 Preview** | 2h | 8B + LoRA | 100-500 traj | 28-35% |
-| **NC1 Full** | 24h | 8B + LoRA | 2k-5k traj | 35-42% |
-| **NC2** | 72h | 32B + LoRA | 10k-20k traj | 45-52% |
-| **NC3** | 1 week | 32B + Full FT | 20k+ traj | 50-57% |
-
-See [ROADMAP.md](ROADMAP.md) for detailed analysis with sources.
-
-## Ground Truth from Published Research
-
-| Model | Pass@1 | TTS@16 | Source |
-|-------|--------|--------|--------|
-| Qwen3-8B baseline | ~25% | - | Raw model |
-| SWE-Lego-Qwen3-8B | 42.2% | 49.6% | Huawei, Jan 2026 |
-| SWE-Lego-Qwen3-32B | 52.6% | 58.8% | Huawei, Jan 2026 |
-| SWE-Star-32B | 57.1% | - | 250k trajectories |
-| Devstral (Mistral) | 46.8% | - | Prior SOTA |
-
-**Key insight**: SWE-Lego achieved 42% with 18k trajectories. We're starting with 100-500.
+| Requirement | Value |
+|-------------|-------|
+| Platform | OpenI (openi.pcl.ac.cn) |
+| NPUs | 4x Ascend 910ProA (32GB each) |
+| Total Memory | 128GB HBM |
+| Framework | MindFormers (MindSpore 2.5+) |
 
 ## Architecture
 
 ```
-Teacher Models (NVIDIA NIM)
-├── Kimi K2.5 (76.8% SWE-bench) ← Primary teacher
-├── DeepSeek V3.2 (73.0%)
-└── Qwen3-Coder-480B (70.6%)
-
-Distillation Pipeline
-├── Generate trajectories from teachers
-├── Filter by test verification
-└── Fine-tune student with LoRA
-
-Student Models
-├── Stage 1-2: Qwen3-8B (16GB)
-└── Stage 3+: Qwen3-32B or Qwen3-Coder-30B-A3B
+Training Pipeline (train.py)
+├── C2NET Context
+│   ├── Model path resolution
+│   ├── Dataset path resolution
+│   └── Output directory
+├── Config Generation
+│   ├── MindFormers YAML (finetune_qwen3_8b_lora.yaml)
+│   └── Parallel speed-up JSON
+├── FlashAttention Patch
+│   ├── Backup original
+│   └── Replace with BMM-Softmax-BMM
+└── Distributed Training
+    └── msrun (4 workers, pipeline parallel)
 ```
 
-## The Hard Truth
+## Configuration
 
-**8B models max out at ~42-50%** (proven by SWE-Lego with 18k trajectories).
+Key training settings in `train.py`:
 
-**32B models max out at ~52-58%** (proven by SWE-Lego, SWE-Star).
+```yaml
+# Parallelism
+model_parallel: 1        # mp=1 avoids Tile sharding bug
+pipeline_stage: 4        # pp=4 uses all 4 NPUs
+micro_batch_num: 4       # Required for pp=4
 
-To get 60%+ requires: 70B+ model OR better teacher OR reinforcement learning.
+# Model
+base_model: Qwen3-8B
+lora_rank: 8
+seq_length: 4096
+
+# FlashAttention (910ProA unsupported)
+use_flash_attention: False
+MS_ENABLE_FLASH_ATTENTION: 0
+MS_DEV_GRAPH_KERNEL_FLAGS: --disable_pass=FlashAttentionFusionV1,V2
+```
+
+## FlashAttention Patch
+
+Ascend 910ProA lacks the FlashAttentionScore CANN kernel. The training script patches `flash_attention.py` at runtime to use standard ops:
+
+```
+FlashAttentionScore (CANN kernel) → BMM-Softmax-BMM (standard ops)
+```
+
+Features:
+- Grouped Query Attention (GQA) support
+- All-static reshape dimensions for graph mode
+- Pipeline parallelism compatible
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for detailed analysis.
+
+| Stage | Model | Data | Target |
+|-------|-------|------|--------|
+| NC-1 Preview | 8B + LoRA | SWE-Lego subset | Pipeline validation |
+| NC-1 | 8B + LoRA | CoderForge 155K | 40-48% |
+| NC-2 | 8B + Scaffold | + verify-on-edit | 55-62% |
+| NC-3 | 8B + RL | GRPO++ | 52-58% pass@1 |
+| NC-5 | 32B + QLoRA | Full dataset | 65-75% |
+
+## Key Fixes Applied
+
+1. **FlashAttention disabled** - Env vars + config.json + YAML + monkey-patch
+2. **Compiler passes disabled** - `MS_DEV_GRAPH_KERNEL_FLAGS` prevents FA fusion
+3. **FlashAttention patched** - BMM-Softmax-BMM replacement with GQA support
+4. **Pipeline parallelism** - mp=1, pp=4 to avoid Tile sharding bug
+5. **Static reshape dims** - Graph-mode compatible with `self.head_num`, `self.head_dim`
 
 ## Folder Structure
 
 ```
-nanocoder/
-├── train.py       # Unified training script
-├── run.sh         # Quick start
-├── README.md      # This file
-└── ROADMAP.md     # Detailed roadmap with sources
+Nano-Coder/
+├── train.py                    # Main training script
+├── README.md                   # This file
+├── ROADMAP.md                  # Detailed roadmap with sources
+└── swe_bench_verified_500.json # SWE-bench dataset
 ```
-
-## Hardware Requirements
-
-- **Stage 1-2**: 4x Ascend 910 NPUs (32GB each) OR 1x A100 40GB
-- **Stage 3+**: 4x A100 80GB or equivalent
-
-## Key Techniques
-
-1. **Knowledge Distillation**: Learn from 76.8% teacher
-2. **Agentic Trajectories**: OpenHands tool-calling sequences
-3. **Test Verification**: Only keep passing solutions
-4. **LoRA Fine-tuning**: Efficient adaptation
-5. **Test-Time Scaling**: +7-8% with verifier (proven by SWE-Lego)
 
 ## References
 
+- [MindFormers](https://gitee.com/mindspore/mindformers) - MindSpore training framework
+- [CoderForge-Preview](https://huggingface.co/datasets/togethercomputer/CoderForge-Preview) - 155K coding trajectories
 - [SWE-bench Verified](https://www.swebench.com/) - Benchmark of 500 GitHub issues
-- [SWE-Lego](https://swe-lego.github.io/) - Huawei's SOTA 8B/32B results
-- [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory) - Training framework
-- [NVIDIA NIM](https://build.nvidia.com) - Free API for frontier models
+- [OpenI Platform](https://openi.pcl.ac.cn) - Free Ascend NPU compute

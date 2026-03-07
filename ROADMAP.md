@@ -1,9 +1,9 @@
 # Nano Coder — Roadmap to the World's Best Small Coding Model
 
-> **Goal:** Best-in-class 8B coding agent, scaling to 32B to approach frontier  
-> **Hardware:** 4×Ascend 910 NPU (32GB each, 128GB total), OpenI platform  
-> **Benchmark:** SWE-bench Verified (500 real GitHub issues)  
-> **Last Updated:** 2026-03-05
+> **Goal:** Best-in-class 8B coding agent, scaling to 32B to approach frontier
+> **Hardware:** 4×Ascend 910ProA NPU (32GB each, 128GB total), OpenI platform
+> **Benchmark:** SWE-bench Verified (500 real GitHub issues)
+> **Last Updated:** 2026-03-07
 
 ## The Battlefield: SWE-bench Verified (March 2026)
 
@@ -116,11 +116,31 @@ partially Layer 3.
 
 ### NC-1 Preview (NOW — 2h debug task) — Pipeline Validation
 
-**Status:** Running on OpenI
+**Status:** Infrastructure ready, testing on OpenI
 
 **What it does:** SFT on SWE-Lego issue→patch pairs (single-turn).
-This proves the OpenI pipeline works: c2net data loading, LLaMA-Factory
+This proves the OpenI pipeline works: c2net data loading, MindFormers
 training, model checkpointing.
+
+**Infrastructure completed:**
+- [x] C2NET context integration (model/data/output paths)
+- [x] MindFormers YAML config generation
+- [x] 4-NPU pipeline parallelism (mp=1, pp=4)
+- [x] FlashAttention disabled (910ProA unsupported)
+- [x] FlashAttention patched with BMM-Softmax-BMM
+- [x] GQA support with static reshape dims
+
+**Ascend 910ProA Compatibility Fixes:**
+```
+Problem: FlashAttentionScore kernel unavailable on 910ProA (only 910B)
+
+Solutions applied:
+1. MS_ENABLE_FLASH_ATTENTION=0 (env var)
+2. MS_DEV_GRAPH_KERNEL_FLAGS=--disable_pass=FlashAttentionFusionV1,V2
+3. use_flash_attention: False in config.json
+4. Monkey-patch Qwen3Config and TransformerConfig
+5. Patch flash_attention.py with BMM-Softmax-BMM implementation
+```
 
 **Expected score:** ~5-10% (single-turn format can't solve real SWE tasks)
 
@@ -139,22 +159,27 @@ working end-to-end.
 - Already tokenized (trajectories-tokenized subset available)
 - Median trajectory: 38K tokens, average 41K tokens
 
-**Model:** Qwen3-8B + LoRA (rank 64, all linear layers)
+**Model:** Qwen3-8B + LoRA (rank 8, attention layers)
 
-**Training config:**
+**Training config (MindFormers):**
 ```yaml
-model_name_or_path: Qwen/Qwen3-8B
-finetuning_type: lora
-lora_rank: 64
-lora_target: all
-cutoff_len: 32768          # Qwen3-8B native context
-per_device_train_batch_size: 1
-gradient_accumulation_steps: 16
-num_train_epochs: 3
-learning_rate: 1.0e-4
-bf16: true
-flash_attn: fa2
-gradient_checkpointing: true
+# Parallelism
+model_parallel: 1          # mp=1 avoids Tile sharding bug
+pipeline_stage: 4          # pp=4 uses all 4 NPUs
+micro_batch_num: 4
+
+# Model
+pet_type: lora
+lora_rank: 8
+lora_alpha: 16
+target_modules: '.*word_embeddings|.*linear_qkv|.*linear_proj|.*linear_fc1|.*linear_fc2'
+
+# Sequence
+seq_length: 4096
+compute_dtype: float16
+
+# FlashAttention (910ProA unsupported)
+use_flash_attention: False
 ```
 
 **Memory estimate:** Qwen3-8B in bf16 = ~16GB, LoRA adapters = ~2GB,
@@ -455,13 +480,14 @@ All on free OpenI compute. $0 GPU cost.
 ## Critical Dependencies
 
 ### Must Have
-- [x] OpenI account with Ascend 910 access
+- [x] OpenI account with Ascend 910ProA access
 - [x] Qwen3-8B base model uploaded to OpenI
 - [x] SWE-Lego dataset uploaded
-- [x] train.py pipeline working (NC-1 Preview)
+- [x] train.py pipeline with MindFormers (NC-1 Preview)
+- [x] FlashAttention patched for 910ProA compatibility
+- [x] 4-NPU pipeline parallelism configured
 - [ ] CoderForge-Preview downloaded and uploaded to OpenI
 - [ ] train.py updated for OpenHands multi-turn format
-- [ ] LLaMA-Factory installed on OpenI (pip install)
 
 ### Should Have
 - [ ] mini-swe-agent fork with verify-on-edit
