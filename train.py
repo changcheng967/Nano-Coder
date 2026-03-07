@@ -566,9 +566,12 @@ class FlashAttention(Cell):
     """
     FlashAttention Layer - PATCHED to use standard BMM-Softmax-BMM.
     Avoids the FlashAttentionScore CANN kernel unavailable on 910ProA.
-    GQA: KV heads expanded via expand_dims + tile + reshape with all-static dims.
-    Verified in graph mode on Ascend 910ProA with shapes:
-      q=(4096,4,32,128) k=(4096,4,8,128) -> output=(4096,4,4096)
+
+    When use_flash_attention=False, the upstream Attention class in attention.py
+    already handles GQA KV head expansion via _repeat_kv() before calling us.
+    So Q, K, V all arrive with the same number of heads (num_attention_heads).
+
+    Input layout from attention.py: (S, B, N, D) - SBND format.
     """
 
     def __init__(self,
@@ -599,14 +602,10 @@ class FlashAttention(Cell):
         else:
             hidden_size_per_attention_head = projection_size // config.num_attention_heads
 
-        # All static Python ints - safe for graph mode reshape
         self.head_num = config.num_attention_heads       # 32
         self.head_dim = hidden_size_per_attention_head   # 128
         self.hidden_size = self.head_num * self.head_dim # 4096
         self.seq_length = config.seq_length              # 4096
-        self.num_query_groups = config.num_query_groups  # 8
-        self.num_heads_per_group = self.head_num // self.num_query_groups if self.num_query_groups > 0 else 1
-        self.use_gqa = self.num_query_groups > 0 and self.num_query_groups < self.head_num
 
         self.input_layout = config.input_layout
         self.sparse_mode = config.sparse_mode
@@ -621,8 +620,6 @@ class FlashAttention(Cell):
         self.add = ops.Add()
         self.transpose = ops.Transpose()
         self.reshape = ops.Reshape()
-        self.expand_dims = ops.ExpandDims()
-        self.tile = ops.Tile()
 
         self.use_alibi_mask = config.use_alibi_mask
         self.use_ring_attention = config.use_ring_attention
@@ -633,7 +630,6 @@ class FlashAttention(Cell):
 
         self.scale_factor = Tensor(self.scale_value, dtype=mstype.float32)
         self.mask_fill_value = Tensor(-10000.0, dtype=mstype.float32)
-        self.kv_tile_shape = (1, 1, self.num_heads_per_group, 1, 1) if self.use_gqa else None
 
         if _get_parallel_mode() in (ParallelMode.AUTO_PARALLEL,) and _is_sharding_propagation():
             self.sharding_propagation(config)
@@ -642,21 +638,8 @@ class FlashAttention(Cell):
 
         print(f"[PATCHED FlashAttention] layer={layer_number}, heads={self.head_num}, "
               f"head_dim={self.head_dim}, seq={self.seq_length}, "
-              f"kv_groups={self.num_query_groups}, gqa={self.use_gqa}")
-
-    def _expand_kv(self, x):
-        """Expand KV heads for GQA: (B, kv_heads, S, D) -> (B, num_heads, S, D)"""
-        if not self.use_gqa:
-            return x
-        # x: (B, num_query_groups, S, D) e.g. (B, 8, 4096, 128)
-        x = self.expand_dims(x, 2)
-        # x: (B, num_query_groups, 1, S, D)
-        x = self.tile(x, self.kv_tile_shape)
-        # x: (B, num_query_groups, num_heads_per_group, S, D)
-        # Merge heads: use explicit batch from shape
-        b = x.shape[0]
-        x = self.reshape(x, (b, self.head_num, self.seq_length, self.head_dim))
-        return x
+              f"layout={self.input_layout}, "
+              f"NOTE: GQA expansion handled by upstream attention.py")
 
     def construct(self,
                   query: Tensor,
@@ -671,24 +654,27 @@ class FlashAttention(Cell):
                   padding_mask=None,
                   actual_seq_qlen=None,
                   actual_seq_kvlen=None):
-        """Standard BMM-Softmax-BMM attention."""
-        # BNSD: input (S, B, N, D) -> (B, N, S, D)
+        """Standard BMM-Softmax-BMM attention.
+
+        When use_flash_attention=False, attention.py calls _repeat_kv() first,
+        so Q, K, V all have shape (S, B, N, D) where N=num_attention_heads (32).
+        No GQA expansion needed here.
+        """
+        # Input: (S, B, N, D) -> transpose to (B, N, S, D) for BatchMatMul
         query = self.transpose(query, (1, 2, 0, 3))
         key = self.transpose(key, (1, 2, 0, 3))
         value = self.transpose(value, (1, 2, 0, 3))
 
-        # Expand KV heads for GQA: 8 -> 32
-        key = self._expand_kv(key)
-        value = self._expand_kv(value)
+        # Q, K, V are all (B, N, S, D) with same N - no expansion needed
 
-        # Attention in fp32
+        # Compute attention in fp32 for numerical stability
         q_f32 = F.cast(query, mstype.float32)
         k_f32 = F.cast(key, mstype.float32)
 
         attn = self.bmm_qk(q_f32, k_f32)
         attn = self.mul(attn, self.scale_factor)
 
-        # Mask: 1=masked, 0=valid
+        # Apply attention mask: 1=masked, 0=valid
         if attention_mask is not None:
             mask_f32 = F.cast(attention_mask, mstype.float32)
             attn = self.add(attn, self.mul(mask_f32, self.mask_fill_value))
@@ -701,10 +687,9 @@ class FlashAttention(Cell):
 
         output = self.bmm_av(attn, value)
 
-        # (B, N, S, D) -> (S, B, H)
-        output = self.transpose(output, (0, 2, 1, 3))
-        output = self.reshape(output, (-1, self.seq_length, self.hidden_size))
-        output = self.transpose(output, (1, 0, 2))
+        # (B, N, S, D) -> (S, B, N, D) -> (S, B, H)
+        output = self.transpose(output, (2, 0, 1, 3))
+        output = self.reshape(output, (self.seq_length, -1, self.hidden_size))
         return output
 
     def shard(self, config: MLATransformerConfig):
