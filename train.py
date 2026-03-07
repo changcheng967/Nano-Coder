@@ -565,7 +565,8 @@ class FlashAttention(Cell):
         self.seq_length = config.seq_length
 
         # GQA support: detect if KV has fewer heads than Q
-        self.kv_num_heads = getattr(config, 'num_kv_heads', self.head_num)
+        # MindFormers uses num_query_groups for GQA (not num_kv_heads)
+        self.kv_num_heads = config.num_query_groups if (hasattr(config, 'num_query_groups') and config.num_query_groups > 0) else self.head_num
         self.use_gqa = self.kv_num_heads < self.head_num
         self.n_rep = self.head_num // self.kv_num_heads if self.use_gqa else 1
 
