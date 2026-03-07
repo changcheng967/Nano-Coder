@@ -525,12 +525,11 @@ class FlashAttention(Cell):
     FlashAttention Layer - PATCHED to use standard BMM-Softmax-BMM.
     Drop-in replacement for FlashAttentionScore CANN kernel on 910ProA.
 
-    With use_flash_attention=False in YAML, upstream attention.py already
-    expands KV heads via _repeat_kv() before calling us.
-    Q, K, V all arrive with same head count (num_attention_heads=32).
+    Handles GQA internally: Q has num_attention_heads, K/V have num_kv_heads.
+    Expands K/V in SBND layout BEFORE transpose to BNSD.
 
-    Input:  Q(S,B,N,D), K(S,B,N,D), V(S,B,N,D) where N=32
-    Output: (S,B,H) where H = N * D = 4096
+    Input:  Q(S,B,Nq,D), K(S,B,Nkv,D), V(S,B,Nkv,D)
+    Output: (S,B,H) where H = Nq * D
     """
 
     def __init__(self,
@@ -565,6 +564,11 @@ class FlashAttention(Cell):
         self.hidden_size = self.head_num * self.head_dim
         self.seq_length = config.seq_length
 
+        # GQA support: detect if KV has fewer heads than Q
+        self.kv_num_heads = getattr(config, 'num_kv_heads', self.head_num)
+        self.use_gqa = self.kv_num_heads < self.head_num
+        self.n_rep = self.head_num // self.kv_num_heads if self.use_gqa else 1
+
         self.input_layout = config.input_layout
         self.sparse_mode = config.sparse_mode
         self.attention_dropout = config.attention_dropout if attention_dropout is None else attention_dropout
@@ -578,6 +582,7 @@ class FlashAttention(Cell):
         self.cast_op = ops.Cast()
         self.transpose_op = ops.Transpose()
         self.reshape_op = ops.Reshape()
+        self.tile_op = ops.Tile()
 
         self.use_alibi_mask = config.use_alibi_mask
         self.use_ring_attention = config.use_ring_attention
@@ -593,19 +598,39 @@ class FlashAttention(Cell):
         elif _get_parallel_mode() in (ParallelMode.SEMI_AUTO_PARALLEL,):
             self.shard(config)
 
-        print(f"[PATCHED FA] layer={layer_number} heads={self.head_num} dim={self.head_dim} "
-              f"seq={self.seq_length} NO GQA expansion (handled upstream by attention.py)")
+        gqa_info = f"GQA kv_heads={self.kv_num_heads} n_rep={self.n_rep}" if self.use_gqa else "no GQA"
+        print(f"[PATCHED FA v6] layer={layer_number} q_heads={self.head_num} dim={self.head_dim} "
+              f"seq={self.seq_length} {gqa_info}")
+
+    def _expand_kv_sbnd(self, x):
+        """Expand KV heads in SBND layout: (S, B, Nkv, D) -> (S, B, Nq, D).
+
+        In SBND layout, -1 only absorbs B since S, Nkv, D are all static.
+        This avoids batch dimension issues from transpose tricks.
+        """
+        if not self.use_gqa:
+            return x
+        # Reshape: (S, -1, Nkv, D) -> (S, -1, Nkv, 1, D)  where -1 absorbs B
+        x = self.reshape_op(x, (self.seq_length, -1, self.kv_num_heads, 1, self.head_dim))
+        # Tile: (S, -1, Nkv, 1, D) -> (S, -1, Nkv, n_rep, D)
+        x = self.tile_op(x, (1, 1, 1, self.n_rep, 1))
+        # Reshape: (S, -1, Nkv, n_rep, D) -> (S, -1, Nq, D)  where Nq = Nkv * n_rep
+        x = self.reshape_op(x, (self.seq_length, -1, self.head_num, self.head_dim))
+        return x
 
     def construct(self, query, key, value, attention_mask,
                   attn_mask_type=None, attention_bias=None, packed_seq_params=None,
                   alibi_mask=None, prefix=None, padding_mask=None,
                   actual_seq_qlen=None, actual_seq_kvlen=None):
-        # Input (S, B, N, D) -> (B, N, S, D)
-        # Upstream attention.py already expanded KV heads via _repeat_kv
-        # Q, K, V all have same N=num_attention_heads
+        # Expand KV heads in SBND layout BEFORE transpose
+        # Q: (S, B, Nq, D), K/V: (S, B, Nkv, D) -> all (S, B, Nq, D)
+        k = self._expand_kv_sbnd(key)
+        v = self._expand_kv_sbnd(value)
+
+        # SBND -> BNSD: (S, B, N, D) -> (B, N, S, D)
         q = self.transpose_op(query, (1, 2, 0, 3))
-        k = self.transpose_op(key, (1, 2, 0, 3))
-        v = self.transpose_op(value, (1, 2, 0, 3))
+        k = self.transpose_op(k, (1, 2, 0, 3))
+        v = self.transpose_op(v, (1, 2, 0, 3))
 
         # BMM in fp32 for numerical stability
         q32 = self.cast_op(q, mstype.float32)
@@ -642,7 +667,13 @@ class FlashAttention(Cell):
 '''
 
         flash_attn_path.write_text(patch_content)
-        print(f"[PATCH] Replaced FlashAttention with standard BMM-Softmax-BMM: {flash_attn_path}")
+        print(f"[PATCH] Replaced FlashAttention with standard BMM-Softmax-BMM (v6 GQA): {flash_attn_path}")
+
+        # Clear pycache to ensure new code is loaded
+        pycache_dir = flash_attn_path.parent / '__pycache__'
+        if pycache_dir.exists():
+            shutil.rmtree(pycache_dir, ignore_errors=True)
+            print(f"[PATCH] Cleared pycache: {pycache_dir}")
     else:
         print(f"[WARN] FlashAttention file not found at {flash_attn_path}")
 
