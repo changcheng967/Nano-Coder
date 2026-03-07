@@ -645,12 +645,17 @@ class FlashAttention(Cell):
               f"kv_groups={self.num_query_groups}, gqa={self.use_gqa}")
 
     def _expand_kv(self, x):
-        """Expand KV heads for GQA. All reshape dims static except batch (-1)."""
+        """Expand KV heads for GQA: (B, kv_heads, S, D) -> (B, num_heads, S, D)"""
         if not self.use_gqa:
             return x
+        # x: (B, num_query_groups, S, D) e.g. (B, 8, 4096, 128)
         x = self.expand_dims(x, 2)
+        # x: (B, num_query_groups, 1, S, D)
         x = self.tile(x, self.kv_tile_shape)
-        x = self.reshape(x, (-1, self.head_num, self.seq_length, self.head_dim))
+        # x: (B, num_query_groups, num_heads_per_group, S, D)
+        # Merge heads: use explicit batch from shape
+        b = x.shape[0]
+        x = self.reshape(x, (b, self.head_num, self.seq_length, self.head_dim))
         return x
 
     def construct(self,
@@ -672,8 +677,9 @@ class FlashAttention(Cell):
         key = self.transpose(key, (1, 2, 0, 3))
         value = self.transpose(value, (1, 2, 0, 3))
 
-        # GQA expansion already done by SelfAttention._repeat_kv() before calling us
-        # Do NOT expand here - key/value already have full head count
+        # Expand KV heads for GQA: 8 -> 32
+        key = self._expand_kv(key)
+        value = self._expand_kv(value)
 
         # Attention in fp32
         q_f32 = F.cast(query, mstype.float32)
