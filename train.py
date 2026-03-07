@@ -430,22 +430,6 @@ def run_training(data_path: Path, model_path: Path, output_dir: Path, cache_stat
     config_path, config_cached = generate_mindformers_config(model_path, data_path, output_dir)
     cache_status['config'] = 'cached' if config_cached else 'created'
 
-    # Force disable FlashAttention in model's config.json (use_legacy=False reads from here)
-    model_config_json = model_path / 'config.json'
-    if model_config_json.exists():
-        with open(model_config_json, 'r') as f:
-            mcfg = json.load(f)
-        changed = False
-        if mcfg.get('use_flash_attention') is not False:
-            mcfg['use_flash_attention'] = False
-            changed = True
-        if changed:
-            with open(model_config_json, 'w') as f:
-                json.dump(mcfg, f, indent=2, ensure_ascii=False)
-            print(f"[FIX] Set use_flash_attention=False in {model_config_json}")
-        else:
-            print(f"[OK] use_flash_attention already False in {model_config_json}")
-
     # Find msrun
     msrun_path = find_executable('msrun')
 
@@ -456,7 +440,8 @@ import sys
 import os
 import argparse
 
-# Force disable FlashAttention at every possible level
+# Disable CANN FlashAttentionScore kernel (910ProA unsupported)
+# But keep use_flash_attention=True so Attention class uses our patched FlashAttention
 os.environ['MS_ENABLE_FLASH_ATTENTION'] = '0'
 os.environ['MS_ENABLE_FA_FLATTEN'] = 'off'
 os.environ['MS_DEV_GRAPH_KERNEL_FLAGS'] = '--disable_pass=FlashAttentionFusionV1,FlashAttentionFusionV2'
@@ -478,38 +463,11 @@ if args.use_parallel.lower() == "true":
     config.use_parallel = True
 config.run_mode = args.run_mode
 
-# CRITICAL: Force use_flash_attention=False in model_config
-# This ensures the Qwen3Config object gets this value regardless of config.json
-if hasattr(config, 'model') and hasattr(config.model, 'model_config'):
-    config.model.model_config.use_flash_attention = False
-    print("[LAUNCHER] Forced use_flash_attention=False in model_config")
+# Keep use_flash_attention=True so Attention uses our patched FlashAttention class
+# Our patch handles GQA internally, replacing FlashAttentionScore kernel
+print("[LAUNCHER] Using patched FlashAttention with BMM-Softmax-BMM (GQA handled internally)")
 
 build_context(config)
-
-# Monkey-patch the Qwen3Config class to force use_flash_attention=False
-try:
-    from mindformers.models.qwen3.configuration_qwen3 import Qwen3Config
-    _orig_init = Qwen3Config.__init__
-    def _patched_init(self, *a, **kw):
-        kw['use_flash_attention'] = False
-        _orig_init(self, *a, **kw)
-        self.use_flash_attention = False
-    Qwen3Config.__init__ = _patched_init
-    print("[LAUNCHER] Monkey-patched Qwen3Config to force use_flash_attention=False")
-except Exception as e:
-    print(f"[LAUNCHER] Warning: Could not patch Qwen3Config: {{e}}")
-
-# Also patch TransformerConfig if it exists
-try:
-    from mindformers.parallel_core.transformer_config import TransformerConfig
-    _orig_tc_init = TransformerConfig.__init__
-    def _patched_tc_init(self, *a, **kw):
-        _orig_tc_init(self, *a, **kw)
-        self.use_flash_attention = False
-    TransformerConfig.__init__ = _patched_tc_init
-    print("[LAUNCHER] Monkey-patched TransformerConfig to force use_flash_attention=False")
-except Exception as e:
-    print(f"[LAUNCHER] Warning: Could not patch TransformerConfig: {{e}}")
 
 from mindformers.trainer import Trainer
 trainer = Trainer(args=config)
@@ -565,13 +523,15 @@ from mindformers.parallel_core.training_graph.device_matrix import layout
 class FlashAttention(Cell):
     """
     FlashAttention Layer - PATCHED to use standard BMM-Softmax-BMM.
-    Avoids the FlashAttentionScore CANN kernel unavailable on 910ProA.
+    Drop-in replacement for FlashAttentionScore CANN kernel on 910ProA.
 
-    When use_flash_attention=False, the upstream Attention class in attention.py
-    already handles GQA KV head expansion via _repeat_kv() before calling us.
-    So Q, K, V all arrive with the same number of heads (num_attention_heads).
+    Handles GQA internally just like the original FlashAttentionScore kernel.
+    When use_flash_attention=True in attention.py, Q/K/V arrive in SBND layout
+    with Q having Nq heads and K/V having Nkv heads (GQA). We expand KV heads
+    to match Q heads before computing attention.
 
-    Input layout from attention.py: (S, B, N, D) - SBND format.
+    Input:  Q(S,B,Nq,D), K(S,B,Nkv,D), V(S,B,Nkv,D)
+    Output: (S,B,H) where H = Nq * D
     """
 
     def __init__(self,
@@ -586,11 +546,11 @@ class FlashAttention(Cell):
         super(FlashAttention, self).__init__()
 
         if attn_mask_type:
-            raise NotImplementedError("For FlashAttention, 'attn_mask_type' is not supported for now.")
+            raise NotImplementedError("For FlashAttention, \\'attn_mask_type\\' is not supported for now.")
         if attention_type:
-            raise NotImplementedError("For FlashAttention, 'attention_type' is unused for now.")
+            raise NotImplementedError("For FlashAttention, \\'attention_type\\' is unused for now.")
         if cp_comm_type:
-            raise NotImplementedError("For FlashAttention, 'cp_comm_type' is not supported for now.")
+            raise NotImplementedError("For FlashAttention, \\'cp_comm_type\\' is not supported for now.")
 
         self.config = config
         self.layer_number = max(1, layer_number)
@@ -602,10 +562,13 @@ class FlashAttention(Cell):
         else:
             hidden_size_per_attention_head = projection_size // config.num_attention_heads
 
-        self.head_num = config.num_attention_heads       # 32
+        self.head_num = config.num_attention_heads       # 32 (Q heads)
         self.head_dim = hidden_size_per_attention_head   # 128
         self.hidden_size = self.head_num * self.head_dim # 4096
         self.seq_length = config.seq_length              # 4096
+        self.kv_num_heads = config.num_query_groups if config.num_query_groups and config.num_query_groups > 0 else self.head_num  # 8
+        self.n_rep = self.head_num // self.kv_num_heads  # 4
+        self.use_gqa = self.kv_num_heads < self.head_num
 
         self.input_layout = config.input_layout
         self.sparse_mode = config.sparse_mode
@@ -618,8 +581,11 @@ class FlashAttention(Cell):
         self.softmax = ops.Softmax(axis=-1)
         self.mul = ops.Mul()
         self.add = ops.Add()
-        self.transpose = ops.Transpose()
-        self.reshape = ops.Reshape()
+        self.cast_op = ops.Cast()
+        self.transpose_op = ops.Transpose()
+        self.reshape_op = ops.Reshape()
+        self.tile_op = ops.Tile()
+        self.expand_dims_op = ops.ExpandDims()
 
         self.use_alibi_mask = config.use_alibi_mask
         self.use_ring_attention = config.use_ring_attention
@@ -636,10 +602,32 @@ class FlashAttention(Cell):
         elif _get_parallel_mode() in (ParallelMode.SEMI_AUTO_PARALLEL,):
             self.shard(config)
 
-        print(f"[PATCHED FlashAttention] layer={layer_number}, heads={self.head_num}, "
-              f"head_dim={self.head_dim}, seq={self.seq_length}, "
-              f"layout={self.input_layout}, "
-              f"NOTE: GQA expansion handled by upstream attention.py")
+        print(f"[PATCHED FlashAttention] layer={layer_number}, q_heads={self.head_num}, "
+              f"kv_heads={self.kv_num_heads}, n_rep={self.n_rep}, "
+              f"head_dim={self.head_dim}, seq={self.seq_length}, gqa={self.use_gqa}")
+
+    def _repeat_kv(self, x):
+        """Expand KV heads to match Q heads for GQA.
+        Input:  (B, Nkv, S, D) where B may be dynamic
+        Output: (B, Nq, S, D) where Nq = Nkv * n_rep
+
+        Strategy: transpose batch to end so reshape -1 only absorbs batch,
+        then transpose back. All non-batch dims are static Python ints.
+        """
+        if not self.use_gqa:
+            return x
+        # Move S and D before B so reshape -1 only captures B
+        # (B, Nkv, S, D) -> (S, D, B, Nkv)
+        x = self.transpose_op(x, (2, 3, 0, 1))
+        # (S, D, B, Nkv) -> (S, D, B, Nkv, 1)
+        x = self.expand_dims_op(x, 4)
+        # (S, D, B, Nkv, 1) -> (S, D, B, Nkv, n_rep)
+        x = self.tile_op(x, (1, 1, 1, 1, self.n_rep))
+        # (S, D, B, Nkv, n_rep) -> (S, D, B, Nq) where -1 = B (only unknown)
+        x = self.reshape_op(x, (self.seq_length, self.head_dim, -1, self.head_num))
+        # (S, D, B, Nq) -> (B, Nq, S, D)
+        x = self.transpose_op(x, (2, 3, 0, 1))
+        return x
 
     def construct(self,
                   query: Tensor,
@@ -654,46 +642,50 @@ class FlashAttention(Cell):
                   padding_mask=None,
                   actual_seq_qlen=None,
                   actual_seq_kvlen=None):
-        """Standard BMM-Softmax-BMM attention.
+        """Drop-in replacement for FlashAttentionScore kernel.
 
-        When use_flash_attention=False, attention.py calls _repeat_kv() first,
-        so Q, K, V all have shape (S, B, N, D) where N=num_attention_heads (32).
-        No GQA expansion needed here.
+        Input layout SBND: Q(S,B,Nq,D), K(S,B,Nkv,D), V(S,B,Nkv,D)
+        Output: (S,B,H) where H = Nq * D
         """
-        # Input: (S, B, N, D) -> transpose to (B, N, S, D) for BatchMatMul
-        query = self.transpose(query, (1, 2, 0, 3))
-        key = self.transpose(key, (1, 2, 0, 3))
-        value = self.transpose(value, (1, 2, 0, 3))
+        # SBND -> BNSD: (S, B, N, D) -> (B, N, S, D)
+        query = self.transpose_op(query, (1, 2, 0, 3))   # (B, Nq, S, D)
+        key = self.transpose_op(key, (1, 2, 0, 3))       # (B, Nkv, S, D)
+        value = self.transpose_op(value, (1, 2, 0, 3))   # (B, Nkv, S, D)
 
-        # Q, K, V are all (B, N, S, D) with same N - no expansion needed
+        # GQA: expand KV heads to match Q heads (8 -> 32)
+        key = self._repeat_kv(key)       # (B, Nq, S, D)
+        value = self._repeat_kv(value)   # (B, Nq, S, D)
 
-        # Compute attention in fp32 for numerical stability
-        q_f32 = F.cast(query, mstype.float32)
-        k_f32 = F.cast(key, mstype.float32)
+        # Attention scores in fp32 for numerical stability
+        q_f32 = self.cast_op(query, mstype.float32)
+        k_f32 = self.cast_op(key, mstype.float32)
 
+        # (B, N, S, D) x (B, N, D, S) -> (B, N, S, S)
         attn = self.bmm_qk(q_f32, k_f32)
         attn = self.mul(attn, self.scale_factor)
 
-        # Apply attention mask: 1=masked, 0=valid
+        # Causal mask: 1=masked -> add large negative value
         if attention_mask is not None:
-            mask_f32 = F.cast(attention_mask, mstype.float32)
+            mask_f32 = self.cast_op(attention_mask, mstype.float32)
             attn = self.add(attn, self.mul(mask_f32, self.mask_fill_value))
 
         attn = self.softmax(attn)
-        attn = F.cast(attn, value.dtype)
+        attn = self.cast_op(attn, query.dtype)
 
         if self.enable_dropout:
             attn, _ = self.dropout(attn)
 
-        output = self.bmm_av(attn, value)
+        # (B, N, S, S) x (B, N, S, D) -> (B, N, S, D)
+        output = self.bmm_av(attn, self.cast_op(value, query.dtype))
 
-        # (B, N, S, D) -> (S, B, N, D) -> (S, B, H)
-        output = self.transpose(output, (2, 0, 1, 3))
-        output = self.reshape(output, (self.seq_length, -1, self.hidden_size))
+        # BNSD -> SBND -> SBH
+        # (B, N, S, D) -> (S, B, N, D)
+        output = self.transpose_op(output, (2, 0, 1, 3))
+        # (S, B, N, D) -> (S, B, H)  where H = N * D
+        output = self.reshape_op(output, (self.seq_length, -1, self.hidden_size))
         return output
 
     def shard(self, config: MLATransformerConfig):
-        """sharding for semi-auto parallel"""
         dp = 1 if config is None else config.data_parallel_size
         tp = 1 if config is None else config.tensor_model_parallel_size
         self.bmm_qk.shard(((dp, tp, 1, 1), (dp, tp, 1, 1)))
@@ -701,7 +693,6 @@ class FlashAttention(Cell):
         self.softmax.shard(((dp, tp, 1, 1),))
 
     def sharding_propagation(self, config: MLATransformerConfig):
-        """sharding propagation mode"""
         pass
 '''
 
