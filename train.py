@@ -525,13 +525,12 @@ class FlashAttention(Cell):
     FlashAttention Layer - PATCHED to use standard BMM-Softmax-BMM.
     Drop-in replacement for FlashAttentionScore CANN kernel on 910ProA.
 
-    Handles GQA internally just like the original FlashAttentionScore kernel.
-    When use_flash_attention=True in attention.py, Q/K/V arrive in SBND layout
-    with Q having Nq heads and K/V having Nkv heads (GQA). We expand KV heads
-    to match Q heads before computing attention.
+    With use_flash_attention=False in YAML, upstream attention.py already
+    expands KV heads via _repeat_kv() before calling us.
+    Q, K, V all arrive with same head count (num_attention_heads=32).
 
-    Input:  Q(S,B,Nq,D), K(S,B,Nkv,D), V(S,B,Nkv,D)
-    Output: (S,B,H) where H = Nq * D
+    Input:  Q(S,B,N,D), K(S,B,N,D), V(S,B,N,D) where N=32
+    Output: (S,B,H) where H = N * D = 4096
     """
 
     def __init__(self,
@@ -546,36 +545,31 @@ class FlashAttention(Cell):
         super(FlashAttention, self).__init__()
 
         if attn_mask_type:
-            raise NotImplementedError("For FlashAttention, \\'attn_mask_type\\' is not supported for now.")
+            raise NotImplementedError("attn_mask_type not supported")
         if attention_type:
-            raise NotImplementedError("For FlashAttention, \\'attention_type\\' is unused for now.")
+            raise NotImplementedError("attention_type unused")
         if cp_comm_type:
-            raise NotImplementedError("For FlashAttention, \\'cp_comm_type\\' is not supported for now.")
+            raise NotImplementedError("cp_comm_type not supported")
 
         self.config = config
         self.layer_number = max(1, layer_number)
 
-        projection_size = self.config.kv_channels * self.config.num_attention_heads
-
+        projection_size = config.kv_channels * config.num_attention_heads
         if config.multi_latent_attention:
-            hidden_size_per_attention_head = config.qk_head_dim + config.qk_pos_emb_head_dim
+            head_dim = config.qk_head_dim + config.qk_pos_emb_head_dim
         else:
-            hidden_size_per_attention_head = projection_size // config.num_attention_heads
+            head_dim = projection_size // config.num_attention_heads
 
-        self.head_num = config.num_attention_heads       # 32 (Q heads)
-        self.head_dim = hidden_size_per_attention_head   # 128
-        self.hidden_size = self.head_num * self.head_dim # 4096
-        self.seq_length = config.seq_length              # 4096
-        self.kv_num_heads = config.num_query_groups if config.num_query_groups and config.num_query_groups > 0 else self.head_num  # 8
-        self.n_rep = self.head_num // self.kv_num_heads  # 4
-        self.use_gqa = self.kv_num_heads < self.head_num
+        self.head_num = config.num_attention_heads
+        self.head_dim = head_dim
+        self.hidden_size = self.head_num * self.head_dim
+        self.seq_length = config.seq_length
 
         self.input_layout = config.input_layout
         self.sparse_mode = config.sparse_mode
         self.attention_dropout = config.attention_dropout if attention_dropout is None else attention_dropout
-        self.scale_value = 1.0 / math.sqrt(hidden_size_per_attention_head) if softmax_scale is None else softmax_scale
+        scale = 1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale
 
-        # Ops
         self.bmm_qk = ops.BatchMatMul(transpose_b=True)
         self.bmm_av = ops.BatchMatMul()
         self.softmax = ops.Softmax(axis=-1)
@@ -584,17 +578,14 @@ class FlashAttention(Cell):
         self.cast_op = ops.Cast()
         self.transpose_op = ops.Transpose()
         self.reshape_op = ops.Reshape()
-        self.tile_op = ops.Tile()
-        self.expand_dims_op = ops.ExpandDims()
 
         self.use_alibi_mask = config.use_alibi_mask
         self.use_ring_attention = config.use_ring_attention
         self.enable_dropout = self.attention_dropout > 0.0
-
         if self.enable_dropout:
             self.dropout = ops.Dropout(keep_prob=1.0 - self.attention_dropout)
 
-        self.scale_factor = Tensor(self.scale_value, dtype=mstype.float32)
+        self.scale_factor = Tensor(scale, dtype=mstype.float32)
         self.mask_fill_value = Tensor(-10000.0, dtype=mstype.float32)
 
         if _get_parallel_mode() in (ParallelMode.AUTO_PARALLEL,) and _is_sharding_propagation():
@@ -602,97 +593,51 @@ class FlashAttention(Cell):
         elif _get_parallel_mode() in (ParallelMode.SEMI_AUTO_PARALLEL,):
             self.shard(config)
 
-        print(f"[PATCHED FlashAttention] layer={layer_number}, q_heads={self.head_num}, "
-              f"kv_heads={self.kv_num_heads}, n_rep={self.n_rep}, "
-              f"head_dim={self.head_dim}, seq={self.seq_length}, gqa={self.use_gqa}")
+        print(f"[PATCHED FA] layer={layer_number} heads={self.head_num} dim={self.head_dim} "
+              f"seq={self.seq_length} NO GQA expansion (handled upstream by attention.py)")
 
-    def _repeat_kv(self, x):
-        """Expand KV heads to match Q heads for GQA.
-        Input:  (B, Nkv, S, D) where B may be dynamic
-        Output: (B, Nq, S, D) where Nq = Nkv * n_rep
+    def construct(self, query, key, value, attention_mask,
+                  attn_mask_type=None, attention_bias=None, packed_seq_params=None,
+                  alibi_mask=None, prefix=None, padding_mask=None,
+                  actual_seq_qlen=None, actual_seq_kvlen=None):
+        # Input (S, B, N, D) -> (B, N, S, D)
+        # Upstream attention.py already expanded KV heads via _repeat_kv
+        # Q, K, V all have same N=num_attention_heads
+        q = self.transpose_op(query, (1, 2, 0, 3))
+        k = self.transpose_op(key, (1, 2, 0, 3))
+        v = self.transpose_op(value, (1, 2, 0, 3))
 
-        Strategy: transpose batch to end so reshape -1 only absorbs batch,
-        then transpose back. All non-batch dims are static Python ints.
-        """
-        if not self.use_gqa:
-            return x
-        # Move S and D before B so reshape -1 only captures B
-        # (B, Nkv, S, D) -> (S, D, B, Nkv)
-        x = self.transpose_op(x, (2, 3, 0, 1))
-        # (S, D, B, Nkv) -> (S, D, B, Nkv, 1)
-        x = self.expand_dims_op(x, 4)
-        # (S, D, B, Nkv, 1) -> (S, D, B, Nkv, n_rep)
-        x = self.tile_op(x, (1, 1, 1, 1, self.n_rep))
-        # (S, D, B, Nkv, n_rep) -> (S, D, B, Nq) where -1 = B (only unknown)
-        x = self.reshape_op(x, (self.seq_length, self.head_dim, -1, self.head_num))
-        # (S, D, B, Nq) -> (B, Nq, S, D)
-        x = self.transpose_op(x, (2, 3, 0, 1))
-        return x
-
-    def construct(self,
-                  query: Tensor,
-                  key: Tensor,
-                  value: Tensor,
-                  attention_mask: Tensor,
-                  attn_mask_type: AttnMaskType = None,
-                  attention_bias: Tensor = None,
-                  packed_seq_params=None,
-                  alibi_mask=None,
-                  prefix=None,
-                  padding_mask=None,
-                  actual_seq_qlen=None,
-                  actual_seq_kvlen=None):
-        """Drop-in replacement for FlashAttentionScore kernel.
-
-        Input layout SBND: Q(S,B,Nq,D), K(S,B,Nkv,D), V(S,B,Nkv,D)
-        Output: (S,B,H) where H = Nq * D
-        """
-        # SBND -> BNSD: (S, B, N, D) -> (B, N, S, D)
-        query = self.transpose_op(query, (1, 2, 0, 3))   # (B, Nq, S, D)
-        key = self.transpose_op(key, (1, 2, 0, 3))       # (B, Nkv, S, D)
-        value = self.transpose_op(value, (1, 2, 0, 3))   # (B, Nkv, S, D)
-
-        # GQA: expand KV heads to match Q heads (8 -> 32)
-        key = self._repeat_kv(key)       # (B, Nq, S, D)
-        value = self._repeat_kv(value)   # (B, Nq, S, D)
-
-        # Attention scores in fp32 for numerical stability
-        q_f32 = self.cast_op(query, mstype.float32)
-        k_f32 = self.cast_op(key, mstype.float32)
-
-        # (B, N, S, D) x (B, N, D, S) -> (B, N, S, S)
-        attn = self.bmm_qk(q_f32, k_f32)
+        # BMM in fp32 for numerical stability
+        q32 = self.cast_op(q, mstype.float32)
+        k32 = self.cast_op(k, mstype.float32)
+        attn = self.bmm_qk(q32, k32)
         attn = self.mul(attn, self.scale_factor)
 
-        # Causal mask: 1=masked -> add large negative value
         if attention_mask is not None:
-            mask_f32 = self.cast_op(attention_mask, mstype.float32)
-            attn = self.add(attn, self.mul(mask_f32, self.mask_fill_value))
+            m32 = self.cast_op(attention_mask, mstype.float32)
+            attn = self.add(attn, self.mul(m32, self.mask_fill_value))
 
         attn = self.softmax(attn)
-        attn = self.cast_op(attn, query.dtype)
+        attn = self.cast_op(attn, q.dtype)
 
         if self.enable_dropout:
             attn, _ = self.dropout(attn)
 
-        # (B, N, S, S) x (B, N, S, D) -> (B, N, S, D)
-        output = self.bmm_av(attn, self.cast_op(value, query.dtype))
+        out = self.bmm_av(attn, self.cast_op(v, q.dtype))
 
-        # BNSD -> SBND -> SBH
-        # (B, N, S, D) -> (S, B, N, D)
-        output = self.transpose_op(output, (2, 0, 1, 3))
-        # (S, B, N, D) -> (S, B, H)  where H = N * D
-        output = self.reshape_op(output, (self.seq_length, -1, self.hidden_size))
-        return output
+        # (B, N, S, D) -> (S, B, N, D) -> (S, B, H)
+        out = self.transpose_op(out, (2, 0, 1, 3))
+        out = self.reshape_op(out, (self.seq_length, -1, self.hidden_size))
+        return out
 
-    def shard(self, config: MLATransformerConfig):
+    def shard(self, config):
         dp = 1 if config is None else config.data_parallel_size
         tp = 1 if config is None else config.tensor_model_parallel_size
         self.bmm_qk.shard(((dp, tp, 1, 1), (dp, tp, 1, 1)))
         self.bmm_av.shard(((dp, tp, 1, 1), (dp, tp, 1, 1)))
         self.softmax.shard(((dp, tp, 1, 1),))
 
-    def sharding_propagation(self, config: MLATransformerConfig):
+    def sharding_propagation(self, config):
         pass
 '''
 
@@ -700,6 +645,19 @@ class FlashAttention(Cell):
         print(f"[PATCH] Replaced FlashAttention with standard BMM-Softmax-BMM: {flash_attn_path}")
     else:
         print(f"[WARN] FlashAttention file not found at {flash_attn_path}")
+
+    # Clear ALL graph caches to ensure recompilation with patched code
+    print("[CLEAN] Clearing graph caches...")
+    import glob as _glob
+    for cache_pattern in ['/home/ma-user/work/rank_*/graph_cache',
+                          '/home/ma-user/work/output/rank_*/graph_cache',
+                          '/home/ma-user/graph_cache']:
+        for cache_dir in _glob.glob(cache_pattern):
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            print(f"[CLEAN] Removed {cache_dir}")
+    # Disable cache during development to always recompile
+    os.environ['MS_COMPILER_CACHE_ENABLE'] = '0'
+    print("[CLEAN] Disabled MS_COMPILER_CACHE_ENABLE for fresh compilation")
 
     try:
         cmd = [
