@@ -22,7 +22,6 @@ import argparse
 import subprocess
 import time
 import shutil
-import textwrap
 from pathlib import Path
 from datetime import datetime
 
@@ -543,248 +542,178 @@ trainer.train()
             shutil.copy2(flash_attn_path, backup_path)
             print(f"[PATCH] Backed up: {backup_path}")
 
-        patch_content = textwrap.dedent('''\
-            # Copyright 2025 Huawei Technologies Co., Ltd
-            # PATCHED: Replace FlashAttentionScore with manual BMM-Softmax-BMM for 910ProA compatibility
-            """Flash Attention Layer - Patched for Ascend 910ProA (no FA binary)"""
-            __all__ = ['FlashAttention']
+        patch_content = '''\
+# Copyright 2025 Huawei Technologies Co., Ltd
+# PATCHED: Replace FlashAttentionScore with manual BMM-Softmax-BMM for 910ProA
+"""Flash Attention Layer - Patched for Ascend 910ProA (no FA binary)"""
+__all__ = ['FlashAttention']
 
-            import math
+import math
 
-            import mindspore.common.dtype as mstype
-            import mindspore as ms
-            from mindspore import ops, ParallelMode, Tensor
-            from mindspore.nn.cell import Cell
-            from mindspore.ops import auto_generate as aclnn_ops
-            from mindspore.ops import functional as F
-            from mindspore.ops import cast
-            from mindspore.parallel._utils import _get_parallel_mode, _is_sharding_propagation
+import mindspore.common.dtype as mstype
+import mindspore as ms
+from mindspore import ops, ParallelMode, Tensor
+from mindspore.nn.cell import Cell
+from mindspore.ops import functional as F
+from mindspore.parallel._utils import _get_parallel_mode, _is_sharding_propagation
 
-            from mindformers.parallel_core.transformer_config import MLATransformerConfig
-            from mindformers.parallel_core.training_graph.transformer.enums import AttnMaskType
-            from mindformers.parallel_core.training_graph.device_matrix import layout
+from mindformers.parallel_core.transformer_config import MLATransformerConfig
+from mindformers.parallel_core.training_graph.transformer.enums import AttnMaskType
+from mindformers.parallel_core.training_graph.device_matrix import layout
 
 
-            class FlashAttention(Cell):
-                """
-                FlashAttention Layer - PATCHED to use standard BMM-Softmax-BMM.
-                This avoids the FlashAttentionScore CANN kernel which is unavailable on 910ProA.
-                """
+class FlashAttention(Cell):
+    """
+    FlashAttention Layer - PATCHED to use standard BMM-Softmax-BMM.
+    Avoids the FlashAttentionScore CANN kernel unavailable on 910ProA.
+    GQA: KV heads expanded via expand_dims + tile + reshape with all-static dims.
+    Verified in graph mode on Ascend 910ProA with shapes:
+      q=(4096,4,32,128) k=(4096,4,8,128) -> output=(4096,4,4096)
+    """
 
-                def __init__(self,
-                             config: MLATransformerConfig,
-                             layer_number,
-                             attn_mask_type: AttnMaskType = None,
-                             attention_type: str = None,
-                             attention_dropout: float = None,
-                             softmax_scale: float = None,
-                             cp_comm_type: str = None,
-                             ):
-                    super(FlashAttention, self).__init__()
+    def __init__(self,
+                 config: MLATransformerConfig,
+                 layer_number,
+                 attn_mask_type: AttnMaskType = None,
+                 attention_type: str = None,
+                 attention_dropout: float = None,
+                 softmax_scale: float = None,
+                 cp_comm_type: str = None,
+                 ):
+        super(FlashAttention, self).__init__()
 
-                    if attn_mask_type:
-                        raise NotImplementedError("For FlashAttention, 'attn_mask_type' is not supported for now.")
-                    if attention_type:
-                        raise NotImplementedError("For FlashAttention, 'attention_type' is unused for now.")
-                    if cp_comm_type:
-                        raise NotImplementedError("For FlashAttention, 'cp_comm_type' is not supported for now.")
+        if attn_mask_type:
+            raise NotImplementedError("For FlashAttention, 'attn_mask_type' is not supported for now.")
+        if attention_type:
+            raise NotImplementedError("For FlashAttention, 'attention_type' is unused for now.")
+        if cp_comm_type:
+            raise NotImplementedError("For FlashAttention, 'cp_comm_type' is not supported for now.")
 
-                    self.config = config
-                    self.layer_number = max(1, layer_number)
-                    self.use_actual_seqlen = config.use_eod_attn_mask_compression
-                    self.cp = 1 if self.config.context_parallel_size is None else self.config.context_parallel_size
+        self.config = config
+        self.layer_number = max(1, layer_number)
 
-                    projection_size = self.config.kv_channels * self.config.num_attention_heads
+        projection_size = self.config.kv_channels * self.config.num_attention_heads
 
-                    if config.multi_latent_attention:
-                        hidden_size_per_attention_head = config.qk_head_dim + config.qk_pos_emb_head_dim
-                    else:
-                        hidden_size_per_attention_head = projection_size // config.num_attention_heads
+        if config.multi_latent_attention:
+            hidden_size_per_attention_head = config.qk_head_dim + config.qk_pos_emb_head_dim
+        else:
+            hidden_size_per_attention_head = projection_size // config.num_attention_heads
 
-                    self.head_num = config.num_attention_heads
-                    self.head_dim = hidden_size_per_attention_head
-                    self.input_layout = config.input_layout
-                    self.sparse_mode = config.sparse_mode
-                    self.attention_dropout = config.attention_dropout if attention_dropout is None else attention_dropout
+        # All static Python ints - safe for graph mode reshape
+        self.head_num = config.num_attention_heads       # 32
+        self.head_dim = hidden_size_per_attention_head   # 128
+        self.hidden_size = self.head_num * self.head_dim # 4096
+        self.seq_length = config.seq_length              # 4096
+        self.num_query_groups = config.num_query_groups  # 8
+        self.num_heads_per_group = self.head_num // self.num_query_groups if self.num_query_groups > 0 else 1
+        self.use_gqa = self.num_query_groups > 0 and self.num_query_groups < self.head_num
 
-                    self.scale_value = 1.0 / math.sqrt(hidden_size_per_attention_head) if softmax_scale is None else softmax_scale
+        self.input_layout = config.input_layout
+        self.sparse_mode = config.sparse_mode
+        self.attention_dropout = config.attention_dropout if attention_dropout is None else attention_dropout
+        self.scale_value = 1.0 / math.sqrt(hidden_size_per_attention_head) if softmax_scale is None else softmax_scale
 
-                    # Standard ops instead of FlashAttentionScore
-                    self.bmm_qk = ops.BatchMatMul(transpose_b=True)
-                    self.bmm_av = ops.BatchMatMul()
-                    self.softmax = ops.Softmax(axis=-1)
-                    self.cast = ops.Cast()
+        # Ops
+        self.bmm_qk = ops.BatchMatMul(transpose_b=True)
+        self.bmm_av = ops.BatchMatMul()
+        self.softmax = ops.Softmax(axis=-1)
+        self.mul = ops.Mul()
+        self.add = ops.Add()
+        self.transpose = ops.Transpose()
+        self.reshape = ops.Reshape()
+        self.expand_dims = ops.ExpandDims()
+        self.tile = ops.Tile()
 
-                    self.use_alibi_mask = config.use_alibi_mask
-                    self.use_mqa = config.num_query_groups == 1
-                    self.use_ring_attention = config.use_ring_attention
-                    self.use_attention_mask = not self.use_ring_attention
-                    self.enable_dropout = self.attention_dropout > 0.0
-                    self.num_query_groups = config.num_query_groups
-                    self.num_heads_per_group = self.head_num // self.num_query_groups if self.num_query_groups > 0 else 1
+        self.use_alibi_mask = config.use_alibi_mask
+        self.use_ring_attention = config.use_ring_attention
+        self.enable_dropout = self.attention_dropout > 0.0
 
-                    if self.enable_dropout:
-                        self.dropout = ops.Dropout(keep_prob=1.0 - self.attention_dropout)
+        if self.enable_dropout:
+            self.dropout = ops.Dropout(keep_prob=1.0 - self.attention_dropout)
 
-                    self.bnsd_transpose = aclnn_ops.Transpose()
-                    self.bsh_transpose = aclnn_ops.Transpose()
-                    self.merge_head_transpose = aclnn_ops.Transpose()
-                    self.shape = aclnn_ops.Shape()
-                    self.reshape = aclnn_ops.Reshape()
-                    self.fa_out_transpose = aclnn_ops.Transpose()
+        self.scale_factor = Tensor(self.scale_value, dtype=mstype.float32)
+        self.mask_fill_value = Tensor(-10000.0, dtype=mstype.float32)
+        self.kv_tile_shape = (1, 1, self.num_heads_per_group, 1, 1) if self.use_gqa else None
 
-                    self.neg_inf = Tensor([-10000.0], dtype=mstype.float32)
-                    self.scale_tensor = Tensor([self.scale_value], dtype=mstype.float32)
+        if _get_parallel_mode() in (ParallelMode.AUTO_PARALLEL,) and _is_sharding_propagation():
+            self.sharding_propagation(config)
+        elif _get_parallel_mode() in (ParallelMode.SEMI_AUTO_PARALLEL,):
+            self.shard(config)
 
-                    print(f"[PATCHED FlashAttention] layer={layer_number}, heads={self.head_num}, "
-                          f"head_dim={self.head_dim}, layout={self.input_layout}, "
-                          f"kv_groups={self.num_query_groups}, dropout={self.attention_dropout}")
+        print(f"[PATCHED FlashAttention] layer={layer_number}, heads={self.head_num}, "
+              f"head_dim={self.head_dim}, seq={self.seq_length}, "
+              f"kv_groups={self.num_query_groups}, gqa={self.use_gqa}")
 
-                def _expand_kv_heads(self, x, batch, seq_len):
-                    """Expand KV heads for GQA using expand_dims + tile + static reshape.
-                    Input:  (B, N_kv, S, D)  e.g. (4, 8, 4096, 128)
-                    Output: (B, N_q, S, D)   e.g. (4, 32, 4096, 128)
-                    Uses static self.head_num and self.head_dim to avoid graph-mode dynamic shape issues.
-                    """
-                    if self.num_heads_per_group <= 1:
-                        return x
-                    # (B, N_kv, S, D) -> (B, N_kv, 1, S, D)
-                    x = ops.expand_dims(x, 2)
-                    # (B, N_kv, 1, S, D) -> (B, N_kv, G, S, D)
-                    x = ops.tile(x, (1, 1, self.num_heads_per_group, 1, 1))
-                    # (B, N_kv, G, S, D) -> (B, N_q, S, D) with static constants
-                    x = x.reshape(-1, self.head_num, x.shape[-2], self.head_dim)
-                    return x
+    def _expand_kv(self, x):
+        """Expand KV heads for GQA. All reshape dims static except batch (-1)."""
+        if not self.use_gqa:
+            return x
+        x = self.expand_dims(x, 2)
+        x = self.tile(x, self.kv_tile_shape)
+        x = self.reshape(x, (-1, self.head_num, self.seq_length, self.head_dim))
+        return x
 
-                def construct(self,
-                              query: Tensor,
-                              key: Tensor,
-                              value: Tensor,
-                              attention_mask: Tensor,
-                              attn_mask_type: AttnMaskType = None,
-                              attention_bias: Tensor = None,
-                              packed_seq_params=None,
-                              alibi_mask=None,
-                              prefix=None,
-                              padding_mask=None,
-                              actual_seq_qlen=None,
-                              actual_seq_kvlen=None):
-                    """Standard BMM-Softmax-BMM attention (no FlashAttentionScore kernel)."""
+    def construct(self,
+                  query: Tensor,
+                  key: Tensor,
+                  value: Tensor,
+                  attention_mask: Tensor,
+                  attn_mask_type: AttnMaskType = None,
+                  attention_bias: Tensor = None,
+                  packed_seq_params=None,
+                  alibi_mask=None,
+                  prefix=None,
+                  padding_mask=None,
+                  actual_seq_qlen=None,
+                  actual_seq_kvlen=None):
+        """Standard BMM-Softmax-BMM attention."""
+        # BNSD: input (S, B, N, D) -> (B, N, S, D)
+        query = self.transpose(query, (1, 2, 0, 3))
+        key = self.transpose(key, (1, 2, 0, 3))
+        value = self.transpose(value, (1, 2, 0, 3))
 
-                    if self.input_layout == "TND":
-                        seq_q, n, d = query.shape
-                        seq_kv = key.shape[0]
-                        bsz = 1
+        # GQA expand KV heads
+        key = self._expand_kv(key)
+        value = self._expand_kv(value)
 
-                        query_4d = self.reshape(query, (1, n, seq_q, d))
-                        key_4d = self.reshape(key, (1, n, seq_kv, d))
-                        value_4d = self.reshape(value, (1, n, seq_kv, d))
+        # Attention in fp32
+        q_f32 = F.cast(query, mstype.float32)
+        k_f32 = F.cast(key, mstype.float32)
 
-                        query_f32 = self.cast(query_4d, mstype.float32)
-                        key_f32 = self.cast(key_4d, mstype.float32)
+        attn = self.bmm_qk(q_f32, k_f32)
+        attn = self.mul(attn, self.scale_factor)
 
-                        attn_weights = self.bmm_qk(query_f32, key_f32)
-                        attn_weights = attn_weights * self.scale_value
+        # Mask: 1=masked, 0=valid
+        if attention_mask is not None:
+            mask_f32 = F.cast(attention_mask, mstype.float32)
+            attn = self.add(attn, self.mul(mask_f32, self.mask_fill_value))
 
-                        if attention_mask is not None:
-                            attention_mask = self.cast(attention_mask, mstype.float32)
-                            attn_weights = attn_weights + attention_mask * (-10000.0)
+        attn = self.softmax(attn)
+        attn = F.cast(attn, value.dtype)
 
-                        attn_weights = self.softmax(attn_weights)
-                        attn_weights = self.cast(attn_weights, value.dtype)
+        if self.enable_dropout:
+            attn, _ = self.dropout(attn)
 
-                        if self.enable_dropout:
-                            attn_weights, _ = self.dropout(attn_weights)
+        output = self.bmm_av(attn, value)
 
-                        output = self.bmm_av(attn_weights, value_4d)
-                        output = self.reshape(output, (seq_q, n, d))
-                        return output
+        # (B, N, S, D) -> (S, B, H)
+        output = self.transpose(output, (0, 2, 1, 3))
+        output = self.reshape(output, (-1, self.seq_length, self.hidden_size))
+        output = self.transpose(output, (1, 0, 2))
+        return output
 
-                    q_seq_len, bsz = query.shape[:2]
-                    kv_seq_len = key.shape[0]
+    def shard(self, config: MLATransformerConfig):
+        """sharding for semi-auto parallel"""
+        dp = 1 if config is None else config.data_parallel_size
+        tp = 1 if config is None else config.tensor_model_parallel_size
+        self.bmm_qk.shard(((dp, tp, 1, 1), (dp, tp, 1, 1)))
+        self.bmm_av.shard(((dp, tp, 1, 1), (dp, tp, 1, 1)))
+        self.softmax.shard(((dp, tp, 1, 1),))
 
-                    if self.input_layout == "BNSD":
-                        query = self.bnsd_transpose(query, (1, 2, 0, 3))
-                        key = self.bnsd_transpose(key, (1, 2, 0, 3))
-                        value = self.bnsd_transpose(value, (1, 2, 0, 3))
-                    elif self.input_layout == "BSH":
-                        query = self.bsh_transpose(query, (1, 0, 2))
-                        key = self.bsh_transpose(key, (1, 0, 2))
-                        value = self.bsh_transpose(value, (1, 0, 2))
-                        query = self.reshape(query, (bsz, q_seq_len, self.head_num, self.head_dim))
-                        query = self.bnsd_transpose(query, (0, 2, 1, 3))
-                        kv_heads = self.num_query_groups if self.num_query_groups > 0 else self.head_num
-                        key = self.reshape(key, (bsz, kv_seq_len, kv_heads, self.head_dim))
-                        key = self.bnsd_transpose(key, (0, 2, 1, 3))
-                        value = self.reshape(value, (bsz, kv_seq_len, kv_heads, self.head_dim))
-                        value = self.bnsd_transpose(value, (0, 2, 1, 3))
-                    else:
-                        query = self.reshape(query, (bsz, q_seq_len, self.head_num, self.head_dim))
-                        query = self.bnsd_transpose(query, (0, 2, 1, 3))
-                        kv_heads = self.num_query_groups if self.num_query_groups > 0 else self.head_num
-                        key = self.reshape(key, (bsz, kv_seq_len, kv_heads, self.head_dim))
-                        key = self.bnsd_transpose(key, (0, 2, 1, 3))
-                        value = self.reshape(value, (bsz, kv_seq_len, kv_heads, self.head_dim))
-                        value = self.bnsd_transpose(value, (0, 2, 1, 3))
-
-                    key = self._expand_kv_heads(key, bsz, kv_seq_len)
-                    value = self._expand_kv_heads(value, bsz, kv_seq_len)
-
-                    query_f32 = self.cast(query, mstype.float32)
-                    key_f32 = self.cast(key, mstype.float32)
-
-                    attn_weights = self.bmm_qk(query_f32, key_f32)
-                    attn_weights = attn_weights * self.scale_value
-
-                    if attention_mask is not None:
-                        attention_mask = self.cast(attention_mask, mstype.float32)
-                        attn_weights = attn_weights + attention_mask * (-10000.0)
-
-                    attn_weights = self.softmax(attn_weights)
-                    attn_weights = self.cast(attn_weights, value.dtype)
-
-                    if self.enable_dropout:
-                        attn_weights, _ = self.dropout(attn_weights)
-
-                    output = self.bmm_av(attn_weights, value)
-
-                    if self.input_layout == "BNSD":
-                        output = self._merge_heads(output)
-                    elif self.input_layout == "BSH":
-                        output = self.merge_head_transpose(output, (0, 2, 1, 3))
-                        bs, seq_len, n_head, head_dim = self.shape(output)
-                        output = self.reshape(output, (bs, seq_len, n_head * head_dim))
-                        output = self.fa_out_transpose(output, (1, 0, 2))
-                    else:
-                        output = self.merge_head_transpose(output, (0, 2, 1, 3))
-                        bs, seq_len, n_head, head_dim = self.shape(output)
-                        output = self.reshape(output, (bs, seq_len, n_head * head_dim))
-                        output = self.fa_out_transpose(output, (1, 0, 2))
-
-                    return output
-
-                def _merge_heads(self, x):
-                    """Convert (B, N, S, D) -> (S, B, H)."""
-                    x = self.merge_head_transpose(x, (0, 2, 1, 3))
-                    bs, seq_len, n_head, head_dim = self.shape(x)
-                    new_shape = (bs, seq_len, n_head * head_dim)
-                    x_merge = self.reshape(x, new_shape)
-                    x_merge = self.fa_out_transpose(x_merge, (1, 0, 2))
-                    return x_merge
-
-                def shard(self, config: MLATransformerConfig):
-                    """sharding for attention - simplified for standard ops"""
-                    dp = 1 if config is None else config.data_parallel_size
-                    tp = 1 if config is None else config.tensor_model_parallel_size
-
-                    self.bmm_qk.shard(((dp, tp, 1, 1), (dp, tp, 1, 1)))
-                    self.bmm_av.shard(((dp, tp, 1, 1), (dp, tp, 1, 1)))
-                    self.softmax.shard(((dp, tp, 1, 1),))
-
-                def sharding_propagation(self, config: MLATransformerConfig):
-                    """sharding propagation mode - no manual strategies needed"""
-                    pass
-            ''')
+    def sharding_propagation(self, config: MLATransformerConfig):
+        """sharding propagation mode"""
+        pass
+'''
 
         flash_attn_path.write_text(patch_content)
         print(f"[PATCH] Replaced FlashAttention with standard BMM-Softmax-BMM: {flash_attn_path}")
