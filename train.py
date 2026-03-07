@@ -641,16 +641,19 @@ trainer.train()
                           f"kv_groups={self.num_query_groups}, dropout={self.attention_dropout}")
 
                 def _expand_kv_heads(self, x, batch, seq_len):
-                    """Expand KV heads to match query heads via tile+reshape (GQA).
-                    Input:  (B, N_kv, S, D)
-                    Output: (B, N_q, S, D) where N_q = N_kv * num_heads_per_group
+                    """Expand KV heads for GQA using expand_dims + tile + static reshape.
+                    Input:  (B, N_kv, S, D)  e.g. (4, 8, 4096, 128)
+                    Output: (B, N_q, S, D)   e.g. (4, 32, 4096, 128)
+                    Uses static self.head_num and self.head_dim to avoid graph-mode dynamic shape issues.
                     """
                     if self.num_heads_per_group <= 1:
                         return x
-                    b, n_kv, s, d = self.shape(x)
-                    x = self.reshape(x, (b, n_kv, 1, s, d))
+                    # (B, N_kv, S, D) -> (B, N_kv, 1, S, D)
+                    x = ops.expand_dims(x, 2)
+                    # (B, N_kv, 1, S, D) -> (B, N_kv, G, S, D)
                     x = ops.tile(x, (1, 1, self.num_heads_per_group, 1, 1))
-                    x = self.reshape(x, (b, n_kv * self.num_heads_per_group, s, d))
+                    # (B, N_kv, G, S, D) -> (B, N_q, S, D) with static constants
+                    x = x.reshape(-1, self.head_num, x.shape[-2], self.head_dim)
                     return x
 
                 def construct(self,
