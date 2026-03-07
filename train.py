@@ -672,9 +672,8 @@ class FlashAttention(Cell):
         key = self.transpose(key, (1, 2, 0, 3))
         value = self.transpose(value, (1, 2, 0, 3))
 
-        # GQA expand KV heads
-        key = self._expand_kv(key)
-        value = self._expand_kv(value)
+        # GQA expansion already done by SelfAttention._repeat_kv() before calling us
+        # Do NOT expand here - key/value already have full head count
 
         # Attention in fp32
         q_f32 = F.cast(query, mstype.float32)
