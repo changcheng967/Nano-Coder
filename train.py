@@ -675,6 +675,30 @@ class FlashAttention(Cell):
         if pycache_dir.exists():
             shutil.rmtree(pycache_dir, ignore_errors=True)
             print(f"[PATCH] Cleared pycache: {pycache_dir}")
+
+        # Also patch attention.py to skip _repeat_kv since our FlashAttention handles GQA
+        attention_path = flash_attn_path.parent / 'attention.py'
+        if attention_path.exists():
+            attn_code = attention_path.read_text()
+            # Replace the block that calls _repeat_kv before core_attention
+            old = """        if not self.use_flash_attention:
+            key = self._repeat_kv(key, self.n_rep)
+            value = self._repeat_kv(value, self.n_rep)
+            context_layer = self.core_attention(query, key, value, attention_mask)"""
+            new = """        if not self.use_flash_attention:
+            # PATCHED: skip _repeat_kv - our FlashAttention patch handles GQA internally
+            context_layer = self.core_attention(query, key, value, attention_mask)"""
+            if old in attn_code:
+                attn_code = attn_code.replace(old, new)
+                attention_path.write_text(attn_code)
+                print(f"[PATCH] Removed _repeat_kv from attention.py - GQA handled by FlashAttention")
+            else:
+                print(f"[WARN] Could not find _repeat_kv pattern in attention.py (may already be patched)")
+
+            # Clear pycache again after attention.py patch
+            if pycache_dir.exists():
+                shutil.rmtree(pycache_dir, ignore_errors=True)
+                print(f"[PATCH] Cleared pycache again after attention.py patch")
     else:
         print(f"[WARN] FlashAttention file not found at {flash_attn_path}")
 
