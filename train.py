@@ -237,8 +237,8 @@ train_dataset_task:
 context:
   mode: 0
   device_target: "Ascend"
-  max_device_memory: "29GB"
-  memory_optimize_level: "O0"
+  max_device_memory: "31GB"
+  memory_optimize_level: "O1"
   jit_config:
     jit_level: "O0"
   ascend_config:
@@ -559,20 +559,20 @@ class FlashAttention(Cell):
         # QK^T: (B*N1, S, D) x (B*N1, D, S) -> (B*N1, S, S)
         scores = mint.bmm(q, mint.permute(k, (0, 2, 1)))
 
-        # Scale in float32
-        scores = scores.to(mstype.float32)
+        # Scale - stay in compute dtype, don't upcast for storage
         scores = mint.mul(scores, self.scale)
 
-        # Causal mask
+        # Causal mask - keep in same dtype
         if attention_mask is not None:
-            mask = attention_mask.to(mstype.float32)
+            mask = attention_mask.to(scores.dtype)
             if mask.ndim == 4:
                 # (B, 1, S, S) -> (B*N1, S, S) using tile instead of broadcast_to
                 mask = ops.tile(mask, (1, self.head_num, 1, 1))  # (B, N1, S, S)
                 mask = mask.reshape(-1, seq_len, seq_len)         # (B*N1, S, S)
             scores = scores + mask * (-10000.0)
 
-        attn_weights = mint.softmax(scores, dim=-1)
+        # Only upcast to fp32 FOR softmax computation, then immediately back
+        attn_weights = mint.softmax(scores.to(mstype.float32), dim=-1).to(scores.dtype)
 
         if self.attention_dropout > 0.0 and self.training:
             attn_weights = ops.dropout(attn_weights, p=self.attention_dropout)
