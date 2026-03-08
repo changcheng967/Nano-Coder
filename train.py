@@ -564,8 +564,9 @@ class FlashAttention(Cell):
             k = ops.tile(k, (1, self.n_rep, 1))
             v = ops.tile(v, (1, self.n_rep, 1))
             # (B*N_kv, n_rep, S*D) -> (B, N_kv*n_rep, S, D) = (B, N1, S, D)
-            k = k.reshape(batch, self.head_num, seq_len, self.head_dim)
-            v = v.reshape(batch, self.head_num, seq_len, self.head_dim)
+            # Use -1 for batch dim (runtime inference with pipeline parallelism)
+            k = k.reshape(-1, self.head_num, seq_len, self.head_dim)
+            v = v.reshape(-1, self.head_num, seq_len, self.head_dim)
 
         # Merge B and N for 3D BMM: (B*N1, S, D)
         q = q.reshape(-1, seq_len, self.head_dim)  # (B*N1, S, D)
@@ -586,8 +587,10 @@ class FlashAttention(Cell):
             mask = attention_mask.to(mstype.float32)
             # If shape is (B, 1, S, S), broadcast across heads
             if mask.ndim == 4:
+                # Get runtime batch size (graph mode safe)
+                b = ops.shape(query)[1]
                 # (B, 1, S, S) -> (B, N1, S, S) -> (B*N1, S, S)
-                mask = mint.broadcast_to(mask, (batch, self.head_num, seq_len, seq_len))
+                mask = mint.broadcast_to(mask, (b, self.head_num, seq_len, seq_len))
                 mask = mask.reshape(-1, seq_len, seq_len)
             # Apply: where mask==1, set to -10000
             scores = scores + mask * (-10000.0)
@@ -607,9 +610,10 @@ class FlashAttention(Cell):
         context = mint.bmm(attn_weights, v)
 
         # (B*N1, S, D) -> (B, N1, S, D) -> (S, B, N1, D) -> (S, B, H)
-        context = context.reshape(batch, self.head_num, seq_len, self.head_dim)
+        # Use -1 for batch dim (runtime inference with pipeline parallelism)
+        context = context.reshape(-1, self.head_num, seq_len, self.head_dim)
         context = mint.permute(context, (2, 0, 1, 3))  # (S, B, N1, D)
-        context = context.reshape(seq_len, batch, self.hidden_size)  # (S, B, H)
+        context = context.reshape(seq_len, -1, self.hidden_size)  # (S, B, H)
 
         return context
 
