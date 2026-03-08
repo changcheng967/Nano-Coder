@@ -582,9 +582,15 @@ class FlashAttention(Cell):
         elif _get_parallel_mode() in (ParallelMode.SEMI_AUTO_PARALLEL,):
             self.shard(config)
 
-        print(f"[NATIVE FA v8] layer={layer_number} q_heads={self.head_num} "
+        # Pre-compute causal mask (2048, 2048) upper-triangular for sparse_mode=3
+        # This is the standard CANN format for rightDownCausal attention
+        import numpy as np
+        causal_np = np.triu(np.ones((2048, 2048), dtype=np.uint8), k=1)
+        self.causal_mask = Tensor(causal_np, dtype=mstype.uint8)
+
+        print(f"[NATIVE FA v9] layer={layer_number} q_heads={self.head_num} "
               f"kv_heads={self.kv_num_heads} dim={self.head_dim} seq={self.seq_length} "
-              f"layout={self.input_layout} scale={self.scalar_value:.6f}")
+              f"layout={self.input_layout} scale={self.scalar_value:.6f} sparse_mode=3")
 
     def construct(self, query, key, value, attention_mask,
                   attn_mask_type=None, attention_bias=None, packed_seq_params=None,
@@ -601,24 +607,18 @@ class FlashAttention(Cell):
         k = self.cast_op(k, mstype.float16)
         v = self.cast_op(v, mstype.float16)
 
-        # Convert attention_mask: MindFormers uses additive mask (0=keep, large_neg=mask)
-        # FlashAttentionScore uses bool/uint8 mask (0/False=keep, 1/True=mask)
-        attn_mask = None
-        if attention_mask is not None:
-            # attention_mask has large negative values where tokens should be masked
-            # Convert to bool: True where masked (value < -1)
-            attn_mask = self.cast_op(attention_mask < -1.0, mstype.uint8)
-
-        # Call native FlashAttentionScore kernel
-        # GQA is handled natively: N1=32 query heads, N2=8 KV heads
+        # Use sparse_mode=3 (rightDownCausal) with compressed (2048,2048) mask
+        # This is the standard approach for causal LLM training on Ascend.
+        # The backward kernel (FlashAttentionScoreGrad) requires this format.
+        # sparse_mode=0 with dynamic masks causes "Fag launch kernel failed".
         out = ops.flash_attention_score(
             q, k, v,
             head_num=self.head_num,
-            attn_mask=attn_mask,
+            attn_mask=self.causal_mask,
             keep_prob=self.keep_prob,
             scalar_value=self.scalar_value,
             input_layout=self.input_layout,
-            sparse_mode=0,
+            sparse_mode=3,
         )
 
         # Output: (B, N1, S, D) in BNSD
@@ -635,7 +635,7 @@ class FlashAttention(Cell):
 '''
 
         flash_attn_path.write_text(patch_content)
-        print(f"[PATCH] Replaced FlashAttention with NATIVE FlashAttentionScore (v8): {flash_attn_path}")
+        print(f"[PATCH] Replaced FlashAttention with NATIVE FlashAttentionScore (v9 causal): {flash_attn_path}")
 
         # Clear pycache to ensure new code is loaded
         pycache_dir = flash_attn_path.parent / '__pycache__'
