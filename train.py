@@ -428,8 +428,8 @@ trainer.train()
     # using mint.bmm + mint.softmax which work on ALL Ascend hardware.
     #
     # Key design decisions:
-    # - All tensors stay ≤ 4D (avoids ReduceSum 8-dim limit)
-    # - GQA handled via mint.repeat_interleave (proven in MindFormers inference)
+    # - All tensors stay ≤ 3D for Tile ops (avoids ReduceSum 8-dim limit)
+    # - GQA handled via reshape+tile+reshape (repeat_interleave is Atlas A2 only)
     # - BMM runs in whatever dtype CANN chooses (allow_fp32_to_fp16 → fp16 on cube)
     # - Softmax runs in float32 for numerical stability
     # - No ops.flash_attention_score anywhere
@@ -551,10 +551,21 @@ class FlashAttention(Cell):
         v = mint.permute(value, (1, 2, 0, 3))  # (B, N2, S, D)
 
         # GQA: expand KV heads to match Q heads
-        # (B, N2, S, D) -> (B, N1, S, D) via repeat_interleave
+        # Cannot use mint.repeat_interleave (Atlas A2 only on this MindSpore)
+        # Use reshape+tile+reshape with max 3D tile to stay under 8-dim CANN limit
         if self.n_rep > 1:
-            k = mint.repeat_interleave(k, repeats=self.n_rep, dim=1)  # (B, N1, S, D)
-            v = mint.repeat_interleave(v, repeats=self.n_rep, dim=1)  # (B, N1, S, D)
+            # k shape: (B, N_kv, S, D) e.g. (B, 8, S, 128)
+            # Strategy: flatten S*D, tile in 3D, reshape back
+            sd = seq_len * self.head_dim  # S * D
+            # (B, N_kv, S, D) -> (B*N_kv, 1, S*D)
+            k = k.reshape(-1, 1, sd)
+            v = v.reshape(-1, 1, sd)
+            # tile dim=1 by n_rep: (B*N_kv, n_rep, S*D) - this is 3D, safe
+            k = ops.tile(k, (1, self.n_rep, 1))
+            v = ops.tile(v, (1, self.n_rep, 1))
+            # (B*N_kv, n_rep, S*D) -> (B, N_kv*n_rep, S, D) = (B, N1, S, D)
+            k = k.reshape(batch, self.head_num, seq_len, self.head_dim)
+            v = v.reshape(batch, self.head_num, seq_len, self.head_dim)
 
         # Merge B and N for 3D BMM: (B*N1, S, D)
         q = q.reshape(-1, seq_len, self.head_dim)  # (B*N1, S, D)
