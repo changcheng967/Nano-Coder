@@ -247,9 +247,9 @@ context:
 
 parallel_config:
   data_parallel: 1
-  model_parallel: 1
-  pipeline_stage: 4
-  micro_batch_num: 4
+  model_parallel: 4
+  pipeline_stage: 1
+  micro_batch_num: 1
   use_seq_parallel: False
   gradient_aggregation_group: 1
 
@@ -257,7 +257,7 @@ micro_batch_interleave_num: 1
 
 parallel:
   parallel_mode: 1
-  enable_alltoall: False
+  enable_alltoall: True
   full_batch: False
   dataset_strategy:
     - [1, 1]
@@ -274,8 +274,8 @@ parallel:
 recompute_config:
   recompute: True
   select_recompute: False
-  parallel_optimizer_comm_recompute: False
-  mp_comm_recompute: False
+  parallel_optimizer_comm_recompute: True
+  mp_comm_recompute: True
 
 model:
   model_config:
@@ -287,9 +287,9 @@ model:
     position_embedding_type: "rope"
     use_contiguous_weight_layout_attention: False
     offset: 0
-    params_dtype: "float32"
+    params_dtype: "float16"
     compute_dtype: "float16"
-    layernorm_compute_dtype: "float32"
+    layernorm_compute_dtype: "float16"
     softmax_compute_dtype: "float32"
     rotary_dtype: "float32"
     fp32_residual_connection: True
