@@ -292,7 +292,7 @@ model:
     layernorm_compute_dtype: "float16"
     softmax_compute_dtype: "float32"
     rotary_dtype: "float32"
-    fp32_residual_connection: True
+    fp32_residual_connection: False
     pet_config:
       pet_type: lora
       lora_rank: 8
