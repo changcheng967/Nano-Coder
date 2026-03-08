@@ -463,8 +463,7 @@ if args.use_parallel.lower() == "true":
 config.run_mode = args.run_mode
 
 # Native FlashAttention handles GQA natively - no patch needed for attention.py
-# Our patch handles GQA internally, replacing FlashAttentionScore kernel
-print("[LAUNCHER] Using patched FlashAttention with BMM-Softmax-BMM (GQA handled internally)")
+print("[LAUNCHER] Using NATIVE FlashAttentionScore (GQA handled natively by CANN kernel)")
 
 build_context(config)
 
@@ -643,6 +642,30 @@ class FlashAttention(Cell):
         if pycache_dir.exists():
             shutil.rmtree(pycache_dir, ignore_errors=True)
             print(f"[PATCH] Cleared pycache: {pycache_dir}")
+
+        # Restore attention.py if it was previously patched to skip _repeat_kv
+        # With native FlashAttention, attention.py should use its original _repeat_kv
+        attention_path = flash_attn_path.parent / 'attention.py'
+        if attention_path.exists():
+            attn_code = attention_path.read_text()
+            # Check if it still has our old skip patch
+            old_patched = """        if not self.use_flash_attention:
+            # PATCHED: skip _repeat_kv - our FlashAttention patch handles GQA internally
+            context_layer = self.core_attention(query, key, value, attention_mask)"""
+            original = """        if not self.use_flash_attention:
+            key = self._repeat_kv(key, self.n_rep)
+            value = self._repeat_kv(value, self.n_rep)
+            context_layer = self.core_attention(query, key, value, attention_mask)"""
+            if old_patched in attn_code:
+                attn_code = attn_code.replace(old_patched, original)
+                attention_path.write_text(attn_code)
+                print(f"[RESTORE] Restored _repeat_kv in attention.py")
+                # Clear pycache again
+                if pycache_dir.exists():
+                    shutil.rmtree(pycache_dir, ignore_errors=True)
+                    print(f"[RESTORE] Cleared pycache after attention.py restore")
+            else:
+                print(f"[OK] attention.py has original _repeat_kv (no restore needed)")
     else:
         print(f"[WARN] FlashAttention file not found at {flash_attn_path}")
 
