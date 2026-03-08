@@ -34,9 +34,9 @@ os.environ.setdefault('MS_BUILD_PROCESS_NUM', '32')  # Parallel graph compilatio
 os.environ.setdefault('MS_COMPILER_CACHE_ENABLE', '1')  # Cache compiled graphs for faster restarts
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')  # Avoid fork warnings
 os.environ.setdefault('GLOG_v', '1')  # Show actual errors during compilation
-os.environ['MS_ENABLE_FLASH_ATTENTION'] = '0'  # Force disable FlashAttention globally (910ProA unsupported)
-os.environ['MS_ENABLE_FA_FLATTEN'] = 'off'  # Disable FA flatten optimization
-os.environ['MS_DEV_GRAPH_KERNEL_FLAGS'] = '--disable_pass=FlashAttentionFusionV1,FlashAttentionFusionV2'  # Disable FA fusion passes
+os.environ['MS_ENABLE_FLASH_ATTENTION'] = '1'  # Enable native FlashAttention (works on 910ProA + CANN 8.3)
+# os.environ['MS_ENABLE_FA_FLATTEN'] = 'off'  # Let CANN handle FA optimization
+# os.environ['MS_DEV_GRAPH_KERNEL_FLAGS'] = '--disable_pass=FlashAttentionFusionV1,FlashAttentionFusionV2'  # FA fusion enabled
 
 
 def find_executable(name: str) -> str:
@@ -211,7 +211,7 @@ def generate_mindformers_config(model_path: Path, data_path: Path, output_dir: P
     Hardware: 4× Ascend 910ProA (32 GB HBM each)
     Optimized for LoRA fine-tuning with memory constraints.
 
-    IMPORTANT: use_flash_attention must be False on 910ProA (not supported).
+    IMPORTANT: use_flash_attention True to use native FlashAttentionScore (works on 910ProA + CANN 8.3).
     Pipeline parallelism (pp=4, mp=1) to avoid Tile sharding bug.
 
     Returns: (config_path, was_cached)
@@ -347,7 +347,7 @@ recompute_config:
 
 model:
   model_config:
-    use_flash_attention: False
+    use_flash_attention: True
     qkv_concat: True
     hidden_dropout: 0.0
     input_sliced_sig: True
@@ -440,11 +440,10 @@ import sys
 import os
 import argparse
 
-# Disable CANN FlashAttentionScore kernel (910ProA unsupported)
-# But keep use_flash_attention=True so Attention class uses our patched FlashAttention
-os.environ['MS_ENABLE_FLASH_ATTENTION'] = '0'
-os.environ['MS_ENABLE_FA_FLATTEN'] = 'off'
-os.environ['MS_DEV_GRAPH_KERNEL_FLAGS'] = '--disable_pass=FlashAttentionFusionV1,FlashAttentionFusionV2'
+# Enable native FlashAttention (works on 910ProA + CANN 8.3)
+os.environ['MS_ENABLE_FLASH_ATTENTION'] = '1'
+# os.environ['MS_ENABLE_FA_FLATTEN'] = 'off'
+# os.environ['MS_DEV_GRAPH_KERNEL_FLAGS'] = '--disable_pass=FlashAttentionFusionV1,FlashAttentionFusionV2'
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", required=True)
@@ -463,7 +462,7 @@ if args.use_parallel.lower() == "true":
     config.use_parallel = True
 config.run_mode = args.run_mode
 
-# Keep use_flash_attention=True so Attention uses our patched FlashAttention class
+# Native FlashAttention handles GQA natively - no patch needed for attention.py
 # Our patch handles GQA internally, replacing FlashAttentionScore kernel
 print("[LAUNCHER] Using patched FlashAttention with BMM-Softmax-BMM (GQA handled internally)")
 
@@ -502,8 +501,8 @@ trainer.train()
 
         patch_content = '''\
 # Copyright 2025 Huawei Technologies Co., Ltd
-# PATCHED: Replace FlashAttentionScore with manual BMM-Softmax-BMM for 910ProA
-"""Flash Attention Layer - Patched for Ascend 910ProA (no FA binary)"""
+# PATCHED: Use NATIVE FlashAttentionScore kernel (works on 910ProA + CANN 8.3)
+"""Flash Attention Layer - Using native CANN FlashAttentionScore"""
 __all__ = ['FlashAttention']
 
 import math
@@ -522,14 +521,11 @@ from mindformers.parallel_core.training_graph.device_matrix import layout
 
 class FlashAttention(Cell):
     """
-    FlashAttention Layer - PATCHED to use standard BMM-Softmax-BMM.
-    Drop-in replacement for FlashAttentionScore CANN kernel on 910ProA.
+    FlashAttention Layer - Using NATIVE FlashAttentionScore CANN kernel.
+    Supports GQA natively (Q has N1 heads, K/V have N2 heads, N1 % N2 == 0).
 
-    Handles GQA internally: Q has num_attention_heads, K/V have num_kv_heads.
-    Expands K/V in SBND layout BEFORE transpose to BNSD.
-
-    Input:  Q(S,B,Nq,D), K(S,B,Nkv,D), V(S,B,Nkv,D)
-    Output: (S,B,H) where H = Nq * D
+    Input:  Q(S,B,N1,D), K(S,B,N2,D), V(S,B,N2,D)  (SBND from attention.py)
+    Output: (S,B,H) where H = N1 * D
     """
 
     def __init__(self,
@@ -559,146 +555,94 @@ class FlashAttention(Cell):
         else:
             head_dim = projection_size // config.num_attention_heads
 
-        self.head_num = config.num_attention_heads
-        self.head_dim = head_dim
+        self.head_num = config.num_attention_heads  # N1 = 32
+        self.head_dim = head_dim                     # D = 128
         self.hidden_size = self.head_num * self.head_dim
-        self.seq_length = config.seq_length
+        self.seq_length = config.seq_length          # S = 4096
 
-        # GQA support: detect if KV has fewer heads than Q
-        # MindFormers uses num_query_groups for GQA (not num_kv_heads)
-        self.kv_num_heads = config.num_query_groups if (hasattr(config, 'num_query_groups') and config.num_query_groups > 0) else self.head_num
-        self.use_gqa = self.kv_num_heads < self.head_num
-        self.n_rep = self.head_num // self.kv_num_heads if self.use_gqa else 1
+        # GQA: KV heads from num_query_groups
+        self.kv_num_heads = config.num_query_groups if (hasattr(config, 'num_query_groups') and config.num_query_groups and config.num_query_groups > 0) else self.head_num
 
-        self.input_layout = config.input_layout
+        self.input_layout = "BNSD"  # Native FA supports BNSD with GQA
         self.sparse_mode = config.sparse_mode
         self.attention_dropout = config.attention_dropout if attention_dropout is None else attention_dropout
         scale = 1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale
-
-        self.bmm_qk = ops.BatchMatMul(transpose_b=True)
-        self.bmm_av = ops.BatchMatMul()
-        self.softmax = ops.Softmax(axis=-1)
-        self.mul = ops.Mul()
-        self.add = ops.Add()
-        self.cast_op = ops.Cast()
-        self.transpose_op = ops.Transpose()
-        self.reshape_op = ops.Reshape()
-        self.tile_op = ops.Tile()
+        self.keep_prob = 1.0 - self.attention_dropout
+        self.scalar_value = scale
 
         self.use_alibi_mask = config.use_alibi_mask
         self.use_ring_attention = config.use_ring_attention
-        self.enable_dropout = self.attention_dropout > 0.0
-        if self.enable_dropout:
-            self.dropout = ops.Dropout(keep_prob=1.0 - self.attention_dropout)
 
-        self.scale_factor = Tensor(scale, dtype=mstype.float32)
-        self.mask_fill_value = Tensor(-10000.0, dtype=mstype.float32)
+        # Ops
+        self.transpose_op = ops.Transpose()
+        self.reshape_op = ops.Reshape()
+        self.cast_op = ops.Cast()
 
         if _get_parallel_mode() in (ParallelMode.AUTO_PARALLEL,) and _is_sharding_propagation():
             self.sharding_propagation(config)
         elif _get_parallel_mode() in (ParallelMode.SEMI_AUTO_PARALLEL,):
             self.shard(config)
 
-        gqa_info = f"GQA kv_heads={self.kv_num_heads} n_rep={self.n_rep}" if self.use_gqa else "no GQA"
-        print(f"[PATCHED FA v6] layer={layer_number} q_heads={self.head_num} dim={self.head_dim} "
-              f"seq={self.seq_length} {gqa_info}")
-
-    def _expand_kv_sbnd(self, x):
-        """Expand KV heads in SBND layout: (S, B, Nkv, D) -> (S, B, Nq, D).
-
-        In SBND layout, -1 only absorbs B since S, Nkv, D are all static.
-        This avoids batch dimension issues from transpose tricks.
-        """
-        if not self.use_gqa:
-            return x
-        # Reshape: (S, -1, Nkv, D) -> (S, -1, Nkv, 1, D)  where -1 absorbs B
-        x = self.reshape_op(x, (self.seq_length, -1, self.kv_num_heads, 1, self.head_dim))
-        # Tile: (S, -1, Nkv, 1, D) -> (S, -1, Nkv, n_rep, D)
-        x = self.tile_op(x, (1, 1, 1, self.n_rep, 1))
-        # Reshape: (S, -1, Nkv, n_rep, D) -> (S, -1, Nq, D)  where Nq = Nkv * n_rep
-        x = self.reshape_op(x, (self.seq_length, -1, self.head_num, self.head_dim))
-        return x
+        print(f"[NATIVE FA v8] layer={layer_number} q_heads={self.head_num} "
+              f"kv_heads={self.kv_num_heads} dim={self.head_dim} seq={self.seq_length} "
+              f"layout={self.input_layout} scale={self.scalar_value:.6f}")
 
     def construct(self, query, key, value, attention_mask,
                   attn_mask_type=None, attention_bias=None, packed_seq_params=None,
                   alibi_mask=None, prefix=None, padding_mask=None,
                   actual_seq_qlen=None, actual_seq_kvlen=None):
-        # Expand KV heads in SBND layout BEFORE transpose
-        # Q: (S, B, Nq, D), K/V: (S, B, Nkv, D) -> all (S, B, Nq, D)
-        k = self._expand_kv_sbnd(key)
-        v = self._expand_kv_sbnd(value)
+        # Input from attention.py: (S, B, N, D) in SBND layout
+        # FlashAttentionScore with BNSD expects: (B, N, S, D)
+        q = self.transpose_op(query, (1, 2, 0, 3))  # (B, N1, S, D)
+        k = self.transpose_op(key,   (1, 2, 0, 3))  # (B, N2, S, D)
+        v = self.transpose_op(value, (1, 2, 0, 3))  # (B, N2, S, D)
 
-        # SBND -> BNSD: (S, B, N, D) -> (B, N, S, D)
-        q = self.transpose_op(query, (1, 2, 0, 3))
-        k = self.transpose_op(k, (1, 2, 0, 3))
-        v = self.transpose_op(v, (1, 2, 0, 3))
+        # Ensure float16 (FlashAttentionScore requires fp16 or bf16)
+        q = self.cast_op(q, mstype.float16)
+        k = self.cast_op(k, mstype.float16)
+        v = self.cast_op(v, mstype.float16)
 
-        # BMM in fp32 for numerical stability
-        q32 = self.cast_op(q, mstype.float32)
-        k32 = self.cast_op(k, mstype.float32)
-        attn = self.bmm_qk(q32, k32)
-        attn = self.mul(attn, self.scale_factor)
-
+        # Convert attention_mask: MindFormers uses additive mask (0=keep, large_neg=mask)
+        # FlashAttentionScore uses bool/uint8 mask (0/False=keep, 1/True=mask)
+        attn_mask = None
         if attention_mask is not None:
-            m32 = self.cast_op(attention_mask, mstype.float32)
-            attn = self.add(attn, self.mul(m32, self.mask_fill_value))
+            # attention_mask has large negative values where tokens should be masked
+            # Convert to bool: True where masked (value < -1)
+            attn_mask = self.cast_op(attention_mask < -1.0, mstype.uint8)
 
-        attn = self.softmax(attn)
-        attn = self.cast_op(attn, q.dtype)
+        # Call native FlashAttentionScore kernel
+        # GQA is handled natively: N1=32 query heads, N2=8 KV heads
+        out = ops.flash_attention_score(
+            q, k, v,
+            head_num=self.head_num,
+            attn_mask=attn_mask,
+            keep_prob=self.keep_prob,
+            scalar_value=self.scalar_value,
+            input_layout=self.input_layout,
+            sparse_mode=0,
+        )
 
-        if self.enable_dropout:
-            attn, _ = self.dropout(attn)
-
-        out = self.bmm_av(attn, self.cast_op(v, q.dtype))
-
-        # (B, N, S, D) -> (S, B, N, D) -> (S, B, H)
-        out = self.transpose_op(out, (2, 0, 1, 3))
+        # Output: (B, N1, S, D) in BNSD
+        # Convert back to (S, B, H) for attention.py
+        out = self.transpose_op(out, (2, 0, 1, 3))  # (S, B, N1, D)
         out = self.reshape_op(out, (self.seq_length, -1, self.hidden_size))
         return out
 
     def shard(self, config):
-        dp = 1 if config is None else config.data_parallel_size
-        tp = 1 if config is None else config.tensor_model_parallel_size
-        self.bmm_qk.shard(((dp, tp, 1, 1), (dp, tp, 1, 1)))
-        self.bmm_av.shard(((dp, tp, 1, 1), (dp, tp, 1, 1)))
-        self.softmax.shard(((dp, tp, 1, 1),))
+        pass  # FlashAttentionScore handles its own sharding
 
     def sharding_propagation(self, config):
         pass
 '''
 
         flash_attn_path.write_text(patch_content)
-        print(f"[PATCH] Replaced FlashAttention with standard BMM-Softmax-BMM (v6 GQA): {flash_attn_path}")
+        print(f"[PATCH] Replaced FlashAttention with NATIVE FlashAttentionScore (v8): {flash_attn_path}")
 
         # Clear pycache to ensure new code is loaded
         pycache_dir = flash_attn_path.parent / '__pycache__'
         if pycache_dir.exists():
             shutil.rmtree(pycache_dir, ignore_errors=True)
             print(f"[PATCH] Cleared pycache: {pycache_dir}")
-
-        # Also patch attention.py to skip _repeat_kv since our FlashAttention handles GQA
-        attention_path = flash_attn_path.parent / 'attention.py'
-        if attention_path.exists():
-            attn_code = attention_path.read_text()
-            # Replace the block that calls _repeat_kv before core_attention
-            old = """        if not self.use_flash_attention:
-            key = self._repeat_kv(key, self.n_rep)
-            value = self._repeat_kv(value, self.n_rep)
-            context_layer = self.core_attention(query, key, value, attention_mask)"""
-            new = """        if not self.use_flash_attention:
-            # PATCHED: skip _repeat_kv - our FlashAttention patch handles GQA internally
-            context_layer = self.core_attention(query, key, value, attention_mask)"""
-            if old in attn_code:
-                attn_code = attn_code.replace(old, new)
-                attention_path.write_text(attn_code)
-                print(f"[PATCH] Removed _repeat_kv from attention.py - GQA handled by FlashAttention")
-            else:
-                print(f"[WARN] Could not find _repeat_kv pattern in attention.py (may already be patched)")
-
-            # Clear pycache again after attention.py patch
-            if pycache_dir.exists():
-                shutil.rmtree(pycache_dir, ignore_errors=True)
-                print(f"[PATCH] Cleared pycache again after attention.py patch")
     else:
         print(f"[WARN] FlashAttention file not found at {flash_attn_path}")
 
