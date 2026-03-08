@@ -531,87 +531,57 @@ class FlashAttention(Cell):
                   attn_mask_type=None, attention_bias=None, packed_seq_params=None,
                   alibi_mask=None, prefix=None, padding_mask=None,
                   actual_seq_qlen=None, actual_seq_kvlen=None):
-        """
-        Args:
-            query:  (S, B, N1, D) - from attention.py SBND layout
-            key:    (S, B, N2, D)
-            value:  (S, B, N2, D)
-            attention_mask: (B, 1, S, S) or similar
+        # Use static seq_length, not dynamic shape
+        seq_len = self.seq_length
 
-        Returns:
-            (S, B, H) where H = N1 * D
-        """
-        # Get shapes
-        seq_len = query.shape[0]   # S
-        batch = query.shape[1]     # B
-
-        # (S, B, N, D) -> (B, N, S, D) via transpose
+        # (S, B, N, D) -> (B, N, S, D)
         q = mint.permute(query, (1, 2, 0, 3))  # (B, N1, S, D)
         k = mint.permute(key,   (1, 2, 0, 3))  # (B, N2, S, D)
         v = mint.permute(value, (1, 2, 0, 3))  # (B, N2, S, D)
 
-        # GQA: expand KV heads to match Q heads
-        # Cannot use mint.repeat_interleave (Atlas A2 only on this MindSpore)
-        # Use reshape+tile+reshape with max 3D tile to stay under 8-dim CANN limit
+        # GQA: expand KV heads via 3D tile
         if self.n_rep > 1:
-            # k shape: (B, N_kv, S, D) e.g. (B, 8, S, 128)
-            # Strategy: flatten S*D, tile in 3D, reshape back
-            sd = seq_len * self.head_dim  # S * D
-            # (B, N_kv, S, D) -> (B*N_kv, 1, S*D)
-            k = k.reshape(-1, 1, sd)
+            sd = self.seq_length * self.head_dim  # static: 4096*128=524288
+            k = k.reshape(-1, 1, sd)              # (B*N_kv, 1, S*D)
             v = v.reshape(-1, 1, sd)
-            # tile dim=1 by n_rep: (B*N_kv, n_rep, S*D) - this is 3D, safe
-            k = ops.tile(k, (1, self.n_rep, 1))
+            k = ops.tile(k, (1, self.n_rep, 1))   # (B*N_kv, n_rep, S*D)
             v = ops.tile(v, (1, self.n_rep, 1))
-            # (B*N_kv, n_rep, S*D) -> (B, N_kv*n_rep, S, D) = (B, N1, S, D)
-            # Use -1 for batch dim (runtime inference with pipeline parallelism)
-            k = k.reshape(-1, self.head_num, seq_len, self.head_dim)
-            v = v.reshape(-1, self.head_num, seq_len, self.head_dim)
+            # Reshape directly to 3D (B*N1, S, D) - skip 4D intermediate
+            k = k.reshape(-1, seq_len, self.head_dim)
+            v = v.reshape(-1, seq_len, self.head_dim)
 
-        # Merge B and N for 3D BMM: (B*N1, S, D)
+        # Merge B and N for 3D BMM
         q = q.reshape(-1, seq_len, self.head_dim)  # (B*N1, S, D)
-        k = k.reshape(-1, seq_len, self.head_dim)  # (B*N1, S, D)
-        v = v.reshape(-1, seq_len, self.head_dim)  # (B*N1, S, D)
+        if self.n_rep <= 1:
+            k = k.reshape(-1, seq_len, self.head_dim)
+            v = v.reshape(-1, seq_len, self.head_dim)
 
         # QK^T: (B*N1, S, D) x (B*N1, D, S) -> (B*N1, S, S)
         scores = mint.bmm(q, mint.permute(k, (0, 2, 1)))
 
-        # Scale (in float32 for numerical stability)
+        # Scale in float32
         scores = scores.to(mstype.float32)
         scores = mint.mul(scores, self.scale)
 
-        # Apply causal mask
+        # Causal mask
         if attention_mask is not None:
-            # attention_mask from MindFormers: (B, 1, S, S), values 0=keep, 1=mask
-            # Expand to (B*N1, S, S)
             mask = attention_mask.to(mstype.float32)
-            # If shape is (B, 1, S, S), broadcast across heads
             if mask.ndim == 4:
-                # Get runtime batch size (graph mode safe)
-                b = ops.shape(query)[1]
-                # (B, 1, S, S) -> (B, N1, S, S) -> (B*N1, S, S)
-                mask = mint.broadcast_to(mask, (b, self.head_num, seq_len, seq_len))
-                mask = mask.reshape(-1, seq_len, seq_len)
-            # Apply: where mask==1, set to -10000
+                # (B, 1, S, S) -> (B*N1, S, S) using tile instead of broadcast_to
+                mask = ops.tile(mask, (1, self.head_num, 1, 1))  # (B, N1, S, S)
+                mask = mask.reshape(-1, seq_len, seq_len)         # (B*N1, S, S)
             scores = scores + mask * (-10000.0)
 
-        # Softmax in float32
         attn_weights = mint.softmax(scores, dim=-1)
 
-        # Dropout (if needed during training)
         if self.attention_dropout > 0.0 and self.training:
             attn_weights = ops.dropout(attn_weights, p=self.attention_dropout)
 
-        # Cast back for V multiplication
-        # allow_fp32_to_fp16 will handle cube ops automatically
         v = v.to(attn_weights.dtype)
+        context = mint.bmm(attn_weights, v)  # (B*N1, S, D)
 
-        # Attention * V: (B*N1, S, S) x (B*N1, S, D) -> (B*N1, S, D)
-        context = mint.bmm(attn_weights, v)
-
-        # (B*N1, S, D) -> (B, N1, S, D) -> (S, B, N1, D) -> (S, B, H)
-        # Use -1 for batch dim (runtime inference with pipeline parallelism)
-        context = context.reshape(-1, self.head_num, seq_len, self.head_dim)
+        # (B*N1, S, D) -> (S, B, H)
+        context = context.reshape(-1, self.head_num, seq_len, self.head_dim)  # (B, N1, S, D)
         context = mint.permute(context, (2, 0, 1, 3))  # (S, B, N1, D)
         context = context.reshape(seq_len, -1, self.hidden_size)  # (S, B, H)
 
