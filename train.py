@@ -147,7 +147,7 @@ def generate_mindformers_config(model_path: Path, data_path: Path, output_dir: P
     """Generate MindFormers YAML config.
 
     CRITICAL for 910ProA:
-    - use_flash_attention: False  (FA kernel only works on Atlas A2 / 910B)
+    - use_flash_attention: True  (routes to our BMM-Softmax-BMM patch, not CANN FA)
     - precision_mode: "allow_fp32_to_fp16"  (cube ops in fp16, vector ops keep original)
       "must_keep_origin_dtype" forces float32 on cube cores which 910ProA rejects.
     """
@@ -279,7 +279,7 @@ recompute_config:
 
 model:
   model_config:
-    use_flash_attention: False
+    use_flash_attention: True
     qkv_concat: True
     hidden_dropout: 0.0
     input_sliced_sig: True
@@ -391,7 +391,7 @@ if args.use_parallel.lower() == "true":
 config.run_mode = args.run_mode
 
 print("[LAUNCHER] 910ProA: Using BMM-Softmax-BMM attention (no FlashAttention)")
-print("[LAUNCHER] precision_mode=allow_fp32_to_fp16, use_flash_attention=False")
+print("[LAUNCHER] precision_mode=allow_fp32_to_fp16, use_flash_attention=True (BMM patch)")
 
 build_context(config)
 
