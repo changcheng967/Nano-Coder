@@ -31,6 +31,8 @@ os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 os.environ.setdefault('GLOG_v', '1')
 # CRITICAL: Disable FlashAttention - 910ProA is NOT Atlas A2, FA kernel has no backward impl
 os.environ['MS_ENABLE_FLASH_ATTENTION'] = '0'
+# Enable VMM to handle memory fragmentation (stitches non-contiguous blocks)
+os.environ['MS_ALLOC_CONF'] = 'enable_vmm:True'
 
 
 def find_executable(name: str) -> str:
@@ -237,8 +239,8 @@ train_dataset_task:
 context:
   mode: 0
   device_target: "Ascend"
-  max_device_memory: "31GB"
-  memory_optimize_level: "O1"
+  max_device_memory: "30GB"
+  memory_optimize_level: "O0"
   jit_config:
     jit_level: "O0"
   ascend_config:
