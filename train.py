@@ -94,7 +94,7 @@ def upload_results(context):
 # DATA CONVERSION
 # ============================================================================
 
-SYSTEM_PROMPT = "You are a software engineer. Given a GitHub issue description, produce a minimal patch (unified diff format) that fixes the issue. Output ONLY the diff, nothing else."
+SYSTEM_PROMPT = "You are Nano Coder 1 Preview, an AI coding assistant created by changcheng967 and supported by Doulet Media. Given a GitHub issue description, produce a minimal patch (unified diff format) that fixes the issue. Output ONLY the diff, nothing else."
 MAX_TOTAL_CHARS = 32000
 
 
@@ -318,7 +318,11 @@ callbacks:
 
 runner_wrapper:
   type: MFTrainOneStepCell
-  scale_sense: 1.0
+  scale_sense:
+    type: DynamicLossScaleUpdateCell
+    loss_scale_value: 4294967296
+    scale_factor: 2
+    scale_window: 2000
   use_clip_grad: True
 
 profile: False
