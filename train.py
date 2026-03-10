@@ -29,6 +29,7 @@ os.environ.setdefault('MS_BUILD_PROCESS_NUM', '32')
 os.environ.setdefault('MS_COMPILER_CACHE_ENABLE', '1')
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 os.environ.setdefault('GLOG_v', '1')
+os.environ.setdefault('GLOG_logtostderr', 'true')  # Print logs to terminal
 # CRITICAL: Disable FlashAttention - 910ProA is NOT Atlas A2, FA kernel has no backward impl
 os.environ['MS_ENABLE_FLASH_ATTENTION'] = '0'
 # Enable VMM to handle memory fragmentation (stitches non-contiguous blocks)
@@ -567,20 +568,23 @@ class FlashAttention(Cell):
         # QK^T: (B*N1, S, D) x (B*N1, D, S) -> (B*N1, S, S)
         scores = mint.bmm(q, mint.permute(k, (0, 2, 1)))
 
-        # Scale - stay in compute dtype, don't upcast for storage
+        # Upcast to fp32 IMMEDIATELY to prevent overflow in scale/mask/softmax
+        # fp16 max is 65504 - raw QK^T scores easily exceed this
+        scores = scores.to(mstype.float32)
+
+        # Scale in fp32
         scores = mint.mul(scores, self.scale)
 
-        # Causal mask - keep in same dtype
+        # Causal mask in fp32
         if attention_mask is not None:
-            mask = attention_mask.to(scores.dtype)
+            mask = attention_mask.to(mstype.float32)
             if mask.ndim == 4:
-                # (B, 1, S, S) -> (B*N1, S, S) using tile instead of broadcast_to
-                mask = ops.tile(mask, (1, self.head_num, 1, 1))  # (B, N1, S, S)
-                mask = mask.reshape(-1, seq_len, seq_len)         # (B*N1, S, S)
+                mask = ops.tile(mask, (1, self.head_num, 1, 1))
+                mask = mask.reshape(-1, seq_len, seq_len)
             scores = scores + mask * (-10000.0)
 
-        # Only upcast to fp32 FOR softmax computation, then immediately back
-        attn_weights = mint.softmax(scores.to(mstype.float32), dim=-1).to(scores.dtype)
+        # Softmax in fp32, then back to compute dtype for V matmul
+        attn_weights = mint.softmax(scores, dim=-1).to(q.dtype)
 
         if self.attention_dropout > 0.0 and self.training:
             attn_weights = ops.dropout(attn_weights, p=self.attention_dropout)
