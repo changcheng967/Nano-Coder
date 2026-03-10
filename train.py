@@ -275,7 +275,7 @@ parallel:
 
 recompute_config:
   recompute: True
-  select_recompute: False
+  select_recompute: True
   parallel_optimizer_comm_recompute: True
   mp_comm_recompute: True
 
@@ -374,6 +374,8 @@ import argparse
 
 # CRITICAL: Disable FlashAttention - 910ProA has no FA backward kernel
 os.environ['MS_ENABLE_FLASH_ATTENTION'] = '0'
+# Enable VMM for memory fragmentation handling
+os.environ['MS_ALLOC_CONF'] = 'enable_vmm:True'
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", required=True)
